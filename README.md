@@ -137,6 +137,8 @@ ollama pull qwen2.5:7b    # 4.7 GB RAM
 ollama pull qwen2.5:3b    # 2.0 GB RAM
 ```
 
+>The Ollama model is defaulted to qwen2.5:3b. Manual choice of model would be included in the next patch.
+
 Ollama must be running in the background when using the AI triage report feature.
 
 ### Step 6 — Install EMBER2024 ML Features (Optional but Recommended)
