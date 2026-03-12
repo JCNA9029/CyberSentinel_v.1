@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ CyberSentinel v2
+# 🛡️ CyberSentinel v1
 
 **A Multi-Tiered Endpoint Detection & Response (EDR) Framework**
 
