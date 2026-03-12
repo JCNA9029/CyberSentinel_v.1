@@ -152,7 +152,7 @@ cd ..
 
 Without this, Tier 2 ML scanning is disabled. Cloud and AI tiers still function.
 
-### Step 7 - Download the Local Machine Learning Models
+### Step 7 — Download the Local Machine Learning Models
 
 Due to GitHub repository size limitations, the compiled LightGBM models are hosted externally. 
 
