@@ -80,6 +80,6 @@ samples/
 *.tar.gz
 *.rar
 # ─── ETC. ──────────────────────────────
-TESTING_GUIDE.txt
 exclusions.txt
 models/
+.gitignore
