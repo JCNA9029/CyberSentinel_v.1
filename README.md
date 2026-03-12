@@ -152,7 +152,15 @@ cd ..
 
 Without this, Tier 2 ML scanning is disabled. Cloud and AI tiers still function.
 
-### Step 7 — (Optional) Install Npcap for JA3 Monitor
+### Step 7 - Download the Local Machine Learning Models
+
+Due to GitHub repository size limitations, the compiled LightGBM models are hosted externally. 
+
+Download the EMBER2024 models from [THIS GOOGLE DRIVE LINK](https://drive.google.com/drive/folders/1dtVVH4Oo5RhoAiMPhqsB4T1X2dGX0v5N?usp=drive_link).
+
+Place the entire `models/` directory directly into your root `CybersentinelModularized/` folder.
+
+### Step 8 — (Optional) Install Npcap for JA3 Monitor
 
 Download and install from https://npcap.com/
 
@@ -162,7 +170,7 @@ Then uncomment scapy in requirements.txt and install:
 pip install scapy
 ```
 
-### Step 8 — Enable PowerShell ScriptBlock Logging for AMSI Monitor
+### Step 9 — Enable PowerShell ScriptBlock Logging for AMSI Monitor
 
 Run PowerShell as Administrator:
 
