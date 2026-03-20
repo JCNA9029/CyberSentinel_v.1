@@ -36,10 +36,9 @@ PyQt6>=6.6.0            # Native desktop GUI (gui.py)
 # Requires Npcap first: https://npcap.com/
 # pip install scapy>=2.5.0
 
-# ── EMBER2024 ML Feature Extraction (installs thrember + signify) ─────────────
-# thrember and signify are NOT on PyPI — install via:
+# ── EMBER2024 ML Feature Extraction (thrember + signify) ──────
+# thrember is NOT on PyPI. Install in this order:
+#   pip install signify==0.7.1
 #   git clone https://github.com/FutureComputing4AI/EMBER2024
 #   cd EMBER2024 && pip install .
-# This installs thrember (2568-dim PE feature extractor) and signify (PE signing).
-# Required for Tier 2 ML and SHAP explainability.
-# Cloud and AI tiers still function without it.
+# Required for Tier 2 ML and SHAP. Cloud and AI tiers work without it.

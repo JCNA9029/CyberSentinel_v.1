@@ -164,16 +164,16 @@ ollama pull deepseek-r1:8b   # 8 GB RAM — higher quality reports
 
 Ollama must be running in the background when using the AI triage report feature.
 
-### Step 6 — Install thrember and signify (EMBER2024 PE feature extractors)
+# Step 6 — Install EMBER2024 ML Features
 
-The ML engine uses thrember for PE feature extraction (produces a 2568-dimensional feature vector):
+# First pin signify to the compatible version
+pip install signify==0.7.1
 
-```bash
+# Then clone and install thrember
 git clone https://github.com/FutureComputing4AI/EMBER2024
 cd EMBER2024
 pip install .
 cd ..
-```
 
 Without this, Tier 2 ML scanning and SHAP explainability are disabled. Cloud and AI tiers still function.
 
