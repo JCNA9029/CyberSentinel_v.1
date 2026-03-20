@@ -63,8 +63,8 @@ File / Process / Network Event
 
 | Category | Feature |
 |----------|---------|
-| **Scanning** | File, directory, hash, IoC batch list, live process |
-| **Cloud Intel** | VirusTotal, AlienVault OTX, MetaDefender, MalwareBazaar — concurrent Smart Consensus |
+| **Scanning** | File, directory, hash, IP address, URL, IoC batch list, live process |
+| **Cloud Intel** | VirusTotal, AlienVault OTX, MetaDefender, MalwareBazaar — concurrent Smart Consensus for file hashes; VirusTotal and AlienVault OTX for IP/URL reputation |
 | **ML Detection** | LightGBM Stage 1 (malicious/safe) + Stage 2 (family classification), θ = 0.60, 100 MB limit |
 | **AI Reports** | Ollama LLM (qwen2.5:3b) triage reports with MITRE ATT&CK mapping, API behavioral analysis, and YARA rules |
 | **SHAP Explainability** | Real-time per-scan TreeExplainer attributions — top-10 features ranked by Shapley value magnitude |
@@ -104,6 +104,7 @@ File / Process / Network Event
 
 > The 100 MB ML file size limit keeps peak memory under ~950 MB on 8 GB hardware.
 > No GPU required — all inference runs on CPU.
+> **Python 3.14 is not supported. Use Python 3.11 or 3.12.**
 
 ### External Tools Required
 
@@ -279,7 +280,7 @@ On first run, CyberSentinel will prompt for a VirusTotal API key.
 
 To configure all keys and the webhook at any time:
 - **GUI:** Settings page (⚙️ sidebar)
-- **CLI:** Option 11 — Configure Cloud Integrations
+- **CLI:** Option 11 — Configure Settings
 
 ### Getting Free API Keys
 
@@ -291,6 +292,9 @@ To configure all keys and the webhook at any time:
 | MalwareBazaar | Free | https://bazaar.abuse.ch |
 
 All API keys are encrypted at rest using Fernet AES-128 with PBKDF2-HMAC-SHA256 key derivation. Plain-text credentials are never written to disk.
+
+> **IP and URL reputation lookups** use VirusTotal and AlienVault OTX only.
+> MetaDefender and MalwareBazaar do not provide IP/URL lookup APIs and are skipped for those indicator types.
 
 ### Setting Up a Discord Webhook Alert
 
@@ -310,7 +314,7 @@ Webhook requests are SSRF-protected — only HTTPS URLs targeting non-private IP
 |---|------|-------------|
 | 1 | Dashboard | Live stats, recent detections, system status |
 | 2 | Scan File | Full pipeline scan with cloud + ML + AI + SHAP |
-| 3 | Scan Hash / IoC | Hash lookup and IoC batch processing |
+| 3 | Scan Hash / IP / URL | Hash lookup, IP reputation, URL reputation, IoC batch processing |
 | 4 | Live EDR | Live process enumeration and on-demand scanning |
 | 5 | LoLBin Abuse | 5-layer LoLBin checker with parent context input |
 | 6 | BYOVD Drivers | LOLDrivers hash scan of System32\drivers |
@@ -319,7 +323,7 @@ Webhook requests are SSRF-protected — only HTTPS URLs targeting non-private IP
 | 9 | Fileless / AMSI | PowerShell ScriptBlock obfuscation alert history |
 | 10 | Network | Host isolation and restore controls |
 | 11 | Intel Feeds | Feed update management and status |
-| 12 | Settings | API keys, webhook, threshold configuration |
+| 12 | Settings | API keys, LLM model selection, webhook configuration |
 | 13 | Evaluation | Quantitative ML benchmarking harness |
 | 14 | Analyst Feedback | Manual verdict review and correction submission |
 | 15 | Adaptive Learning | Queue management, anchor store, retraining controls |
@@ -435,7 +439,7 @@ The production LoLBin engine runs five layers in sequence per process event:
 | Quarantine | Fernet AES-128 encrypted vault — files cannot execute |
 | Webhook | HTTPS-only, blocks private IP ranges (SSRF protection) |
 | Intel feed integrity | Minimum size check + JSON/CSV parseability validation |
-| Hash input validation | Regex fullmatch `[0-9a-fA-F]{32|40|64}` before API calls |
+| Hash input validation | Regex fullmatch `[0-9a-fA-F]{32\|40\|64}` before API calls |
 | Model integrity | SHA-256 hash file (TOFU) — tamper detection on model load |
 | Rate limiting | Token bucket per API: VirusTotal 4/min, OTX 10/min |
 | Anchor validation | Cross-checked against scan cache before registration |
@@ -463,6 +467,8 @@ python CyberSentinel.py
 
 **Adaptive learning trigger:** Submit a FALSE_POSITIVE correction from the Analyst Feedback page. Check the **Adaptive Learning** page — the correction appears in the queue.
 
+**IP/URL scan trigger:** Open the Scan Hash / IP / URL page and paste an IP address or a full URL starting with `http://` or `https://`. VirusTotal and AlienVault OTX will be queried. MetaDefender and MalwareBazaar are skipped for IP/URL indicators.
+
 ---
 
 ## Troubleshooting
@@ -477,6 +483,20 @@ pip install PyQt6
 pip install shap
 ```
 
+**`[!] Warning: 'thrember' library not found. Local ML scanning will be unavailable.`**
+Thrember is not on PyPI and must be installed from the EMBER2024 repository. Run Step 6 exactly in order:
+```bash
+pip install signify==0.7.1
+git clone https://github.com/FutureComputing4AI/EMBER2024
+cd EMBER2024
+pip install .
+cd ..
+```
+If the warning persists, make sure you are running CyberSentinel from inside the same virtual environment where you ran the above commands.
+
+**Python 3.14 — thrember install fails or ML unavailable**
+Python 3.14 is not supported. Install Python 3.11 or 3.12 from https://www.python.org/downloads/, create a fresh virtual environment using that version (`py -3.11 -m venv venv`), and reinstall all dependencies inside it.
+
 **ML engine says "Not a valid Windows PE"**
 The file is not a real executable. ML and SHAP require valid PE structure (MZ magic byte). EICAR is a plain-text COM file — this is expected behaviour.
 
@@ -485,6 +505,9 @@ No longer an issue — the engine dynamically detects the feature count on first
 
 **AI report shows "No extracted APIs"**
 The file is packed, obfuscated, or has no Import Address Table. The AI report will generate an entropy/size-based YARA rule instead. This is correct behaviour.
+
+**IP/URL scan returns INCONCLUSIVE**
+You are offline or your API keys are not configured. VirusTotal and AlienVault OTX are required for IP and URL lookups. Do not treat an INCONCLUSIVE result as SAFE — verify manually when online.
 
 **Webhook not firing**
 - Configure URL in Settings — must start with `https://`

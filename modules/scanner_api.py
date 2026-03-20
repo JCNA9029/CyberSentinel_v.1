@@ -72,6 +72,8 @@ class VirusTotalAPI:
     Consensus threshold: 3 or more detection engines must flag the hash
     before the verdict is elevated to MALICIOUS. This reduces false positives
     from single-engine noise in the aggregated results.
+
+    Also supports IP address and URL reputation lookups via the v3 API.
     """
 
     BASE_URL = "https://www.virustotal.com/api/v3/files/"
@@ -112,6 +114,65 @@ class VirusTotalAPI:
         except RequestException:
             return None
 
+    def get_ip_report(self, ip: str) -> dict | None:
+        """Queries VirusTotal v3 for an IP address reputation verdict."""
+        if not self.api_key:
+            return None
+        _vt_limiter.acquire()
+        try:
+            resp = requests.get(
+                f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+                headers=self.headers,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                stats = (
+                    resp.json()
+                    .get("data", {})
+                    .get("attributes", {})
+                    .get("last_analysis_stats", {})
+                )
+                malicious_count = stats.get("malicious", 0)
+                return {
+                    "verdict":          "MALICIOUS" if malicious_count >= 3 else "SAFE",
+                    "engines_detected": malicious_count,
+                }
+            return None
+        except RequestException:
+            return None
+
+    def get_url_report(self, url_indicator: str) -> dict | None:
+        """Queries VirusTotal v3 for a URL reputation verdict."""
+        import base64 as _b64
+        if not self.api_key:
+            return None
+        _vt_limiter.acquire()
+        try:
+            # VirusTotal v3 URL lookup requires base64url-encoded URL (no padding)
+            url_id = _b64.urlsafe_b64encode(
+                url_indicator.encode()
+            ).decode().rstrip("=")
+            resp = requests.get(
+                f"https://www.virustotal.com/api/v3/urls/{url_id}",
+                headers=self.headers,
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                stats = (
+                    resp.json()
+                    .get("data", {})
+                    .get("attributes", {})
+                    .get("last_analysis_stats", {})
+                )
+                malicious_count = stats.get("malicious", 0)
+                return {
+                    "verdict":          "MALICIOUS" if malicious_count >= 3 else "SAFE",
+                    "engines_detected": malicious_count,
+                }
+            return None
+        except RequestException:
+            return None
+
 
 class AlienVaultAPI:
     """
@@ -119,6 +180,8 @@ class AlienVaultAPI:
 
     A hash is considered MALICIOUS if it belongs to one or more threat
     intelligence "pulses" in the OTX community database.
+
+    Also supports IP address and URL reputation lookups via OTX indicators.
     """
 
     def __init__(self, api_key: str):
@@ -155,6 +218,49 @@ class AlienVaultAPI:
             return None
         except ValueError:
             print("[-] AlienVault: Invalid JSON in response.")
+            return None
+
+    def get_ip_report(self, ip: str) -> dict | None:
+        """Queries AlienVault OTX for an IP address reputation verdict."""
+        if not self.api_key:
+            return None
+        try:
+            _otx_limiter.acquire()
+            url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/general"
+            resp = requests.get(url, headers=self.headers, timeout=5)
+            if resp.status_code == 200:
+                pulse_count = (
+                    resp.json().get("pulse_info", {}).get("count", 0)
+                )
+                return {
+                    "verdict":          "MALICIOUS" if pulse_count > 0 else "SAFE",
+                    "engines_detected": pulse_count,
+                }
+            return None
+        except (Timeout, RequestException, ValueError):
+            return None
+
+    def get_url_report(self, url_indicator: str) -> dict | None:
+        """Queries AlienVault OTX for a URL/domain reputation verdict."""
+        if not self.api_key:
+            return None
+        try:
+            _otx_limiter.acquire()
+            # OTX uses domain as the indicator type for URL lookups
+            from urllib.parse import urlparse as _urlparse
+            domain = _urlparse(url_indicator).netloc or url_indicator
+            url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/general"
+            resp = requests.get(url, headers=self.headers, timeout=5)
+            if resp.status_code == 200:
+                pulse_count = (
+                    resp.json().get("pulse_info", {}).get("count", 0)
+                )
+                return {
+                    "verdict":          "MALICIOUS" if pulse_count > 0 else "SAFE",
+                    "engines_detected": pulse_count,
+                }
+            return None
+        except (Timeout, RequestException, ValueError):
             return None
 
 

@@ -87,7 +87,10 @@ class CyberSentinelUI:
 
     def _menu_analyze_hash(self):
         print("\n" + "="*50)
-        user_input = input("Hash or .txt IoC file (Enter to cancel): ").strip().strip('"\'')
+        print("[*] Supported: MD5/SHA-1/SHA-256 hash, IPv4 address, or URL")
+        print("[*] Note: IP and URL lookups use VirusTotal and AlienVault OTX only")
+        print("[*]       MetaDefender and MalwareBazaar do not support IP/URL lookups")
+        user_input = input("\nHash, IP, URL, or .txt IoC file (Enter to cancel): ").strip().strip('"\'')
         if not user_input: return
         if os.path.isfile(user_input) and user_input.endswith(".txt"):
             try:
@@ -98,9 +101,7 @@ class CyberSentinelUI:
                 for h in valid: print("\n"+"─"*30); self.logic.scan_hash(h)
             except Exception as e: colors.error(f"[-] {e}")
         else:
-            if len(user_input) not in (32,40,64):
-                colors.error("[-] Must be a .txt path or 32/40/64-char hash."); return
-            self.logic.scan_hash(user_input)
+            self.logic.scan_indicator(user_input)
 
     def _menu_live_edr(self):
         path = get_target_process_path()
@@ -301,7 +302,7 @@ class CyberSentinelUI:
             print("="*50)
             print("  ── Core Scanning ──────────────────")
             print("   1. Scan Local File or Directory")
-            print("   2. Scan Hash or IoC Batch List")
+            print("   2. Scan Hash / IP / URL / IoC Batch")
             print("   3. Analyze Active Memory (Live EDR)")
             print("  ── Detectors ──────────────────────")
             print("   4. LoLBin Abuse Checker")

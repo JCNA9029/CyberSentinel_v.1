@@ -625,13 +625,64 @@ Format output EXACTLY using these headers:
                                 + ", ".join(cloud_apis[:5])
                                 + (" ..." if len(cloud_apis) > 5 else "")
                             )
+                        else:
+                            self.log_event(
+                                "[*] IAT analysis: No APIs readable — file may be packed or obfuscated. "
+                                "Proceeding to Tier 2 ML for structural analysis."
+                            )
                     except Exception:
-                        pass  # Non-critical — report proceeds without API context
+                        pass
+
+                # ── Tier 2 ML runs even on cloud-MALICIOUS files ────────────
+                # This gives analysts SHAP explainability and a second independent
+                # verdict even when cloud already confirmed the threat.
+                # Packed files that hide their IAT can still be scored structurally.
+                ml_cloud_apis = cloud_apis
+                if file_size_mb <= 100.0 and file_path and os.path.isfile(file_path):
+                    self.log_event("\n[*] Running Tier 2 ML for independent structural analysis...")
+                    ml_result_cloud = self.ml_scanner.scan_stage1(file_path)
+                    if ml_result_cloud is not None:
+                        ml_v  = ml_result_cloud["verdict"]
+                        ml_sc = ml_result_cloud["score"]
+                        if ml_v == "CRITICAL RISK":
+                            colors.critical(f"[*] TIER 2 VERDICT: {ml_v} (Score: {ml_sc:.2%})")
+                        elif ml_v == "SUSPICIOUS":
+                            colors.warning(f"[*] TIER 2 VERDICT: {ml_v} (Score: {ml_sc:.2%})")
+                        else:
+                            colors.success(f"[+] TIER 2 VERDICT: {ml_v} (Score: {ml_sc:.2%})")
+                        self.session_log.append(f"[*] TIER 2 (supplemental): {ml_v} ({ml_sc:.2%})")
+                        # Prefer ML-extracted APIs over IAT-only if available
+                        if ml_result_cloud.get("detected_apis"):
+                            ml_cloud_apis = ml_result_cloud["detected_apis"]
+                            self.log_event(
+                                f"[*] Tier 2 APIs: {len(ml_cloud_apis)} API(s) — "
+                                + ", ".join(ml_cloud_apis[:5])
+                                + (" ..." if len(ml_cloud_apis) > 5 else "")
+                            )
+                        # Run SHAP explainability on the cloud-confirmed malicious file
+                        try:
+                            from .explainability import run_shap_explanation
+                            run_shap_explanation(
+                                self.ml_scanner.booster,
+                                ml_result_cloud["features"],
+                                ml_v,
+                                ml_sc,
+                                sha256,
+                                filename,
+                                self.log_event,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        self.log_event(
+                            "[-] Tier 2: Could not process file (invalid PE or packed beyond "
+                            "static extraction). Structural analysis unavailable."
+                        )
 
                 # Save APIs to cache so future cache-hit reports also have them
                 utils.save_cached_result(
                     sha256, cloud_verdict, intel_context,
-                    detected_apis=cloud_apis,
+                    detected_apis=ml_cloud_apis,
                 )
 
                 if file_size_mb > 100.0:
@@ -639,7 +690,7 @@ Format output EXACTLY using these headers:
                 # Quarantine fires for all cloud MALICIOUS verdicts regardless of file size.
                 self._prompt_quarantine(
                     file_path, sha256, cloud_context, "MALICIOUS", filename,
-                    detected_apis=cloud_apis,
+                    detected_apis=ml_cloud_apis,
                 )
                 return
             else:
@@ -745,6 +796,118 @@ Format output EXACTLY using these headers:
     #  PUBLIC: SCAN HASH
     # ─────────────────────────────────────────────
 
+    def scan_indicator(self, indicator: str):
+        """
+        Routes an indicator to the correct scan method based on its type.
+
+        Accepts:
+          - IP address  (e.g. 185.220.101.45)
+          - URL         (e.g. http://evil.com/payload.exe)
+          - Hash        (MD5 / SHA-1 / SHA-256 — routed to scan_hash)
+
+        IP and URL lookups are supported by VirusTotal and AlienVault OTX only.
+        MetaDefender and MalwareBazaar do not offer IP/URL reputation APIs
+        so they are skipped for these indicator types.
+        """
+        import re as _re
+        indicator = indicator.strip()
+
+        # Detect IP address (IPv4 only)
+        if _re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", indicator):
+            self._scan_ip(indicator)
+            return
+
+        # Detect URL
+        if indicator.startswith("http://") or indicator.startswith("https://"):
+            self._scan_url(indicator)
+            return
+
+        # Fall through to hash scan for everything else
+        self.scan_hash(indicator)
+
+    def _scan_ip(self, ip: str):
+        """Queries VirusTotal and AlienVault OTX for an IP address verdict."""
+        from modules.scanner_api import VirusTotalAPI, AlienVaultAPI
+        self.log_event("─" * 60)
+        colors.info(f"[*] IP Reputation Scan: {ip}")
+        colors.info("[*] Querying VirusTotal and AlienVault OTX...")
+        colors.warning("[!] Note: MetaDefender and MalwareBazaar do not support IP lookups — skipped.")
+        self.session_log.append(f"[*] IP Scan: {ip}")
+
+        results = {}
+        if self.api_keys.get("virustotal"):
+            vt = VirusTotalAPI(self.api_keys["virustotal"])
+            results["VirusTotal"] = vt.get_ip_report(ip)
+        if self.api_keys.get("alienvault"):
+            otx = AlienVaultAPI(self.api_keys["alienvault"])
+            results["AlienVault OTX"] = otx.get_ip_report(ip)
+
+        if not results:
+            colors.error("[-] No API keys configured for IP lookup. Add VirusTotal or AlienVault OTX in Settings.")
+            return
+
+        self._display_indicator_results(ip, "IP", results)
+
+    def _scan_url(self, url_indicator: str):
+        """Queries VirusTotal and AlienVault OTX for a URL reputation verdict."""
+        from modules.scanner_api import VirusTotalAPI, AlienVaultAPI
+        self.log_event("─" * 60)
+        colors.info(f"[*] URL Reputation Scan: {url_indicator}")
+        colors.info("[*] Querying VirusTotal and AlienVault OTX...")
+        colors.warning("[!] Note: MetaDefender and MalwareBazaar do not support URL lookups — skipped.")
+        self.session_log.append(f"[*] URL Scan: {url_indicator}")
+
+        results = {}
+        if self.api_keys.get("virustotal"):
+            vt = VirusTotalAPI(self.api_keys["virustotal"])
+            results["VirusTotal"] = vt.get_url_report(url_indicator)
+        if self.api_keys.get("alienvault"):
+            otx = AlienVaultAPI(self.api_keys["alienvault"])
+            results["AlienVault OTX"] = otx.get_url_report(url_indicator)
+
+        if not results:
+            colors.error("[-] No API keys configured for URL lookup. Add VirusTotal or AlienVault OTX in Settings.")
+            return
+
+        self._display_indicator_results(url_indicator, "URL", results)
+
+    def _display_indicator_results(self, indicator: str, itype: str, results: dict):
+        """Displays and logs IP/URL reputation results from all queried engines."""
+        any_malicious = False
+        all_failed    = True
+
+        for engine, result in results.items():
+            if result is None:
+                colors.warning(f"  [-] {engine}: No record found or API error.")
+                continue
+            all_failed = False
+            verdict    = result.get("verdict", "UNKNOWN")
+            detected   = result.get("engines_detected", 0)
+            if verdict == "MALICIOUS":
+                any_malicious = True
+                colors.critical(f"  [!] {engine}: MALICIOUS ({detected} detection(s))")
+            else:
+                colors.success(f"  [+] {engine}: SAFE ({detected} detection(s))")
+
+        # All engines failed — likely offline or API keys not configured
+        if all_failed:
+            colors.error(
+                f"\n[!] INCONCLUSIVE — All engines failed to respond.\n"
+                f"    This usually means you are offline or your API keys are not configured.\n"
+                f"    Do NOT treat this as a SAFE result. Verify manually when online."
+            )
+            self.session_log.append(
+                f"[!] {itype} SCAN INCONCLUSIVE (offline/no keys): {indicator}"
+            )
+            return
+
+        if any_malicious:
+            colors.critical(f"\n[!] FINAL VERDICT: MALICIOUS — {itype} flagged by one or more engines")
+            self.session_log.append(f"[!] {itype} VERDICT: MALICIOUS — {indicator}")
+        else:
+            colors.success(f"\n[+] FINAL VERDICT: SAFE — No engines flagged this {itype.lower()}")
+            self.session_log.append(f"[+] {itype} VERDICT: SAFE — {indicator}")
+
     def scan_hash(self, file_hash: str):
         """Hash-only pipeline: Cache → concurrent Tier 1 cloud consensus."""
         # V4 Fix: Validate hash format before any API call.
@@ -771,15 +934,16 @@ Format output EXACTLY using these headers:
             self.log_event(f"    Verdict  : {cached['verdict']}")
             self.log_event(f"    Cached On: {cached['timestamp']}")
             self.log_event(f"    Source   : {cached['source']}")
-            # Cached malicious hash scans still require webhook and quarantine.
             cached_verdict = cached['verdict'].upper()
             if any(v in cached_verdict for v in ("MALICIOUS", "CRITICAL")):
-                self._prompt_quarantine(
-                    "",          # no file path for hash-only scans
-                    file_hash,
-                    f"Cache Hit ({cached['source']})",
-                    cached['verdict'],
-                    file_hash[:16] + "...",
+                colors.critical(
+                    "[!] This hash is flagged as MALICIOUS in the local cache.\n"
+                    "    If you have the actual file on disk, scan it directly\n"
+                    "    via Scan File to trigger quarantine and containment."
+                )
+                self.session_log.append(
+                    f"[!] HASH FLAGGED: {file_hash} — "
+                    "Scan the file directly to quarantine it."
                 )
             return
 
@@ -790,22 +954,21 @@ Format output EXACTLY using these headers:
 
         if cloud_verdict == "MALICIOUS":
             colors.critical(f"\n[!] FINAL VERDICT: MALICIOUS — {cloud_context}")
+            colors.critical(
+                "[!] This hash is confirmed MALICIOUS by cloud engines.\n"
+                "    If you have the actual file on disk, scan it directly\n"
+                "    via Scan File to trigger quarantine and containment."
+            )
             self.session_log.append(f"[!] HASH VERDICT: MALICIOUS — {cloud_context}")
         else:
             colors.success(f"\n[+] FINAL VERDICT: SAFE — {cloud_context}")
             self.session_log.append(f"[+] HASH VERDICT: SAFE")
 
         if cloud_verdict:
-            utils.save_cached_result(file_hash, cloud_verdict, f"Cloud Consensus ({cloud_context})")
-            # Trigger containment flow for new malicious hash verdicts
-            if cloud_verdict == "MALICIOUS":
-                self._prompt_quarantine(
-                    "",           # no file path for hash-only scans
-                    file_hash,
-                    cloud_context,
-                    "MALICIOUS",
-                    file_hash[:16] + "...",
-                )
+            utils.save_cached_result(
+                file_hash, cloud_verdict,
+                f"Cloud Consensus ({cloud_context})"
+            )
 
     # ─────────────────────────────────────────────
     #  SESSION LOG

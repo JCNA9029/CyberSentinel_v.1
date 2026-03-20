@@ -393,17 +393,21 @@ class HashWorker(QThread):
     line_out = pyqtSignal(str)
     finished = pyqtSignal(bool)
 
-    def __init__(self, logic, hashes: list):
+    def __init__(self, logic, hashes: list, use_indicator: bool = False):
         super().__init__()
-        self.logic  = logic
-        self.hashes = hashes
+        self.logic        = logic
+        self.hashes       = hashes
+        self.use_indicator = use_indicator  # True = route through scan_indicator (IP/URL/hash)
 
     def run(self):
         cap = OutputCapture(self.line_out)
         sys.stdout = cap
         try:
             for h in self.hashes:
-                self.logic.scan_hash(h)
+                if self.use_indicator:
+                    self.logic.scan_indicator(h)
+                else:
+                    self.logic.scan_hash(h)
             self.finished.emit(True)
         except Exception as e:
             self.line_out.emit(f"[-] Error: {e}")
@@ -728,7 +732,7 @@ class CyberSentinelGUI(QMainWindow):
             ]),
             ("CORE SCANNING", [
                 ("🔍  Scan File",        "scan_file"),
-                ("🔑  Scan Hash / IoC", "scan_hash"),
+                ("🔑  Scan Hash / IP / URL", "scan_hash"),
                 ("⚡  Live EDR",         "live_edr"),
             ]),
             ("DETECTORS", [
@@ -776,6 +780,34 @@ class CyberSentinelGUI(QMainWindow):
         scroll.setWidget(nav_widget)
         layout.addWidget(scroll, 1)
 
+        # Global Save Session button — always visible, saves full session log
+        self._global_save_btn = QPushButton("💾  Save Session")
+        self._global_save_btn.setToolTip(
+            "Save everything logged this session to a .txt report file.\n"
+            "Captures file scans, hash/IP/URL lookups, detections, and all verdicts."
+        )
+        self._global_save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {THEME['surface']};
+                color: {THEME['muted']};
+                border: none;
+                border-top: 1px solid {THEME['border']};
+                border-radius: 0;
+                padding: 8px 14px;
+                font-size: 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background: {THEME['blue_bg']};
+                color: {THEME['blue']};
+            }}
+            QPushButton:pressed {{
+                color: {THEME['text']};
+            }}
+        """)
+        self._global_save_btn.clicked.connect(self._global_save_session)
+        layout.addWidget(self._global_save_btn)
+
         # Bottom status
         self._status_bar = QLabel("● Ready")
         self._status_bar.setStyleSheet(f"""
@@ -788,6 +820,23 @@ class CyberSentinelGUI(QMainWindow):
         layout.addWidget(self._status_bar)
 
         return sidebar
+
+    def _global_save_session(self):
+        """
+        Global save session handler — callable from the sidebar at any time.
+        Saves the full session log regardless of which page is currently active.
+        Shows a message if the session log is empty.
+        """
+        if not self.logic.session_log:
+            QMessageBox.information(
+                self,
+                "Nothing to Save",
+                "The session log is empty.\n\n"
+                "Run a scan, hash lookup, IP/URL check, or any detection first\n"
+                "and then save the session."
+            )
+            return
+        self.logic.save_session_log()
 
     def _nav_style(self, active: bool) -> str:
         if active:
@@ -1401,8 +1450,8 @@ class CyberSentinelGUI(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._page_header(
-            "🔑", "Scan Hash / IoC Batch",
-            "Enter a SHA-256/MD5/SHA-1 hash, or load a .txt IoC list"
+            "🔑", "Scan Hash / IP / URL / IoC Batch",
+            "Enter a hash (MD5/SHA-1/SHA-256), an IP address, or a URL for reputation lookup"
         ))
 
         inner = QWidget()
@@ -1410,12 +1459,28 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.setContentsMargins(24, 20, 24, 20)
         inner_layout.setSpacing(12)
 
-        grp = QGroupBox("Hash Input")
+        # API support notice
+        notice = QLabel(
+            "Hash scanning: VirusTotal, AlienVault OTX, MetaDefender, MalwareBazaar\n"
+            "IP / URL scanning: VirusTotal and AlienVault OTX only "
+            "(MetaDefender and MalwareBazaar do not support IP/URL lookups)"
+        )
+        notice.setStyleSheet(
+            f"color: {THEME['muted']}; font-size: 10px; "
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            "border-radius: 4px; padding: 6px 10px;"
+        )
+        notice.setWordWrap(True)
+        inner_layout.addWidget(notice)
+
+        grp = QGroupBox("Indicator Input")
         grp_layout = QVBoxLayout(grp)
 
         single_row = QHBoxLayout()
         self._hash_input = QLineEdit()
-        self._hash_input.setPlaceholderText("Paste a single SHA-256 / MD5 / SHA-1 hash…")
+        self._hash_input.setPlaceholderText(
+            "Paste a hash (MD5/SHA-1/SHA-256), an IP address, or a URL starting with http:// or https://"
+        )
         self._hash_input.returnPressed.connect(self._run_hash_scan)
         single_row.addWidget(self._hash_input)
         scan_hash_btn = QPushButton("▶  Scan")
@@ -1442,7 +1507,10 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.addWidget(grp)
 
         self._hash_console = ConsoleWidget()
-        self._hash_console.append_line("● Enter a hash or load a .txt batch file.", THEME["muted"])
+        self._hash_console.append_line(
+            "● Enter a hash, IP address, URL, or load a .txt batch file.",
+            THEME["muted"]
+        )
         inner_layout.addWidget(self._hash_console, 1)
 
         layout.addWidget(inner, 1)
@@ -1457,12 +1525,20 @@ class CyberSentinelGUI(QMainWindow):
         h = self._hash_input.text().strip()
         if not h:
             return
-        if len(h) not in (32, 40, 64):
-            QMessageBox.warning(self, "Invalid Hash", "Hash must be 32 (MD5), 40 (SHA-1), or 64 (SHA-256) characters.")
+        import re as _re
+        is_ip   = bool(_re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", h))
+        is_url  = h.startswith("http://") or h.startswith("https://")
+        is_hash = len(h) in (32, 40, 64)
+        if not (is_ip or is_url or is_hash):
+            QMessageBox.warning(
+                self, "Invalid Input",
+                "Enter a valid hash (32/40/64 hex chars), an IPv4 address, "
+                "or a URL starting with http:// or https://"
+            )
             return
         self._hash_console.clear_console()
         self._register_gui_callbacks(self._hash_console)
-        worker = HashWorker(self.logic, [h])
+        worker = HashWorker(self.logic, [h], use_indicator=True)
         worker.line_out.connect(self._hash_console.append_line)
         worker.finished.connect(lambda ok: self._refresh_dashboard())
         self._workers.append(worker)

@@ -27,12 +27,13 @@ ENV/
 threat_cache.db
 v2_predictions.db
 
+
 # Encrypted config — contains API keys and webhook URL
 config.json
 
 # Quarantine folder — contains actual malware samples
 Quarantine/
-quarantine_zone/
+quarantine/
 
 # Baseline learning flag
 baseline_learning.flag
