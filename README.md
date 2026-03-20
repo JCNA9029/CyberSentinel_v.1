@@ -164,12 +164,12 @@ ollama pull deepseek-r1:8b   # 8 GB RAM — higher quality reports
 
 Ollama must be running in the background when using the AI triage report feature.
 
-# Step 6 — Install EMBER2024 ML Features
+### Step 6 — Install EMBER2024 ML Features
 
-# First pin signify to the compatible version
+#### First pin signify to the compatible version
 pip install signify==0.7.1
 
-# Then clone and install thrember
+#### Then clone and install thrember
 git clone https://github.com/FutureComputing4AI/EMBER2024
 cd EMBER2024
 pip install .
