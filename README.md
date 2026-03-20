@@ -164,7 +164,7 @@ ollama pull deepseek-r1:8b   # 8 GB RAM — higher quality reports
 
 Ollama must be running in the background when using the AI triage report feature.
 
-### Step 6 — Install EMBER2024 ML Features
+### Step 6 — Install thrember and signify (EMBER2024 PE feature extractors)
 
 The ML engine uses thrember for PE feature extraction (produces a 2568-dimensional feature vector):
 
@@ -191,7 +191,7 @@ Due to GitHub size limitations, the compiled LightGBM models are hosted external
 
 Download the `models/` directory from [Google Drive](https://drive.google.com/drive/folders/1dtVVH4Oo5RhoAiMPhqsB4T1X2dGX0v5N?usp=drive_link).
 
-Place the entire `models/` directory directly into your root `CybersentinelModularized/` folder.
+Place the entire `models/` directory directly into your root `CyberSentinel_v.1/` folder.
 
 ### Step 9 — (Optional) Install Npcap for JA3 Monitor
 
