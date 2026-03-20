@@ -25,13 +25,14 @@ ENV/
 # ── CyberSentinel runtime data ────────────────
 # Database — contains scan history and keys. Never commit.
 threat_cache.db
+v2_predictions.db
 
 # Encrypted config — contains API keys and webhook URL
 config.json
 
 # Quarantine folder — contains actual malware samples
 Quarantine/
-quarantine/
+quarantine_zone/
 
 # Baseline learning flag
 baseline_learning.flag
