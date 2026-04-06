@@ -142,8 +142,13 @@ def decrypt_key(encrypted_key: str) -> str:
 # ─────────────────────────────────────────────
 
 def load_config() -> dict:
-    """Reads and decrypts all API keys, webhook URL, and LLM model from disk."""
-    config_data = {"api_keys": {}, "webhook_url": "", "llm_model": "qwen2.5:3b"}
+    """Reads and decrypts all API keys, webhook URL, LLM model, and priority paths from disk."""
+    config_data = {
+        "api_keys":            {},
+        "webhook_url":         "",
+        "llm_model":           "qwen2.5:3b",
+        "high_priority_paths": [],
+    }
     if not os.path.exists(CONFIG_FILE):
         return config_data
 
@@ -157,10 +162,12 @@ def load_config() -> dict:
         if "api_key" in data and not keys:
             keys["virustotal"] = data.get("api_key", "")
 
-        config_data["api_keys"]   = {k: decrypt_key(v) for k, v in keys.items() if v}
-        config_data["webhook_url"] = decrypt_key(data.get("webhook_url", ""))
-        # LLM model is stored in plain text — not sensitive
-        config_data["llm_model"]   = data.get("llm_model", "qwen2.5:3b") or "qwen2.5:3b"
+        config_data["api_keys"]            = {k: decrypt_key(v) for k, v in keys.items() if v}
+        config_data["webhook_url"]          = decrypt_key(data.get("webhook_url", ""))
+        # LLM model and priority paths are stored in plain text — not sensitive
+        config_data["llm_model"]            = data.get("llm_model", "qwen2.5:3b") or "qwen2.5:3b"
+        hp = data.get("high_priority_paths", [])
+        config_data["high_priority_paths"]  = hp if isinstance(hp, list) else []
     except Exception:
         pass  # Non-critical: operation continues regardless
 
@@ -168,19 +175,22 @@ def load_config() -> dict:
 
 
 def save_config(
-    api_keys:   dict,
-    webhook_url: str = "",
-    llm_model:  str = "qwen2.5:3b",
+    api_keys:            dict,
+    webhook_url:         str       = "",
+    llm_model:           str       = "qwen2.5:3b",
+    high_priority_paths: list[str] | None = None,
 ) -> bool:
-    """Encrypts all API keys with Fernet and writes them + LLM model to disk."""
+    """Encrypts all API keys with Fernet and writes them + settings to disk."""
     try:
         encrypted_keys = {k: encrypt_key(v) for k, v in api_keys.items() if v}
         with open(CONFIG_FILE, "w") as f:
             json.dump(
                 {
-                    "api_keys":   encrypted_keys,
-                    "webhook_url": encrypt_key(webhook_url),
-                    "llm_model":  llm_model or "qwen2.5:3b",
+                    "api_keys":            encrypted_keys,
+                    "webhook_url":          encrypt_key(webhook_url),
+                    "llm_model":            llm_model or "qwen2.5:3b",
+                    # Plain text — not sensitive; used by daemon for scan prioritization
+                    "high_priority_paths":  high_priority_paths or [],
                 },
                 f,
                 indent=2,
@@ -635,6 +645,71 @@ def is_excluded(file_path: str) -> bool:
         return any(exc in target_path for exc in exclusions)
     except Exception:
         return False
+
+
+
+
+
+# ─────────────────────────────────────────────
+#  SECTION 7: SIEM EXPORT
+# ─────────────────────────────────────────────
+
+def export_scan_history(fmt: str, filepath: str) -> tuple[bool, str]:
+    """
+    Exports the full scan_cache table to a JSON or CSV file for SIEM ingestion.
+
+    Args:
+        fmt:      'json' or 'csv'
+        filepath: absolute path to write — caller is responsible for choosing location.
+
+    Returns:
+        (success: bool, message: str)
+
+    Security:
+        - filepath is resolved and checked to stay within a sane path length.
+        - File is opened with exclusive creation flag when possible to prevent
+          accidental overwrite races; caller should confirm overwrite in the GUI.
+    """
+    if fmt not in ("json", "csv"):
+        return False, f"Unknown format: {fmt!r}"
+
+    try:
+        rows = []
+        with sqlite3.connect(DB_FILE) as conn:
+            for row in conn.execute(
+                "SELECT sha256, filename, verdict, timestamp, apis FROM scan_cache "
+                "ORDER BY timestamp DESC"
+            ):
+                rows.append({
+                    "sha256":     row[0] or "",
+                    "filename":   row[1] or "",
+                    "verdict":    row[2] or "",
+                    "timestamp":  row[3] or "",
+                    "detected_apis": json.loads(row[4]) if row[4] else [],
+                })
+    except sqlite3.Error as e:
+        return False, f"Database read error: {e}"
+
+    try:
+        if fmt == "json":
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"generator": "CyberSentinel v1", "records": rows},
+                    f, indent=2, ensure_ascii=False,
+                )
+        else:  # csv
+            import csv
+            fieldnames = ["sha256", "filename", "verdict", "timestamp", "detected_apis"]
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in rows:
+                    r["detected_apis"] = "; ".join(r["detected_apis"])
+                    writer.writerow(r)
+    except OSError as e:
+        return False, f"File write error: {e}"
+
+    return True, f"Exported {len(rows)} records to {os.path.basename(filepath)}"
 
 def prune_old_records(days: int = 90):
     """

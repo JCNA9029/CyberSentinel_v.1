@@ -104,7 +104,10 @@ class ScannerLogic:
             return {"verdict": None, "context": "No APIs configured", "sources": []}
 
         malicious_sources: list[str] = []
-        unknown_sources: list[str] = []
+        unknown_sources:  list[str] = []
+        # Quorum tracking — populated when VirusTotal returns engines_total
+        _vt_detected: int = 0
+        _vt_total:    int = 0
 
         with ThreadPoolExecutor(max_workers=len(engine_map)) as pool:
             futures = {pool.submit(fn): name for name, fn in engine_map.items()}
@@ -116,16 +119,38 @@ class ScannerLogic:
                         self.log_event(f"    -> {name}: UNKNOWN (No record / API error)")
                         unknown_sources.append(name)
                     elif result.get("verdict") == "MALICIOUS":
-                        hits = result.get("engines_detected", 0)
-                        colors.critical(f"    -> {name}: MALICIOUS (Hits: {hits})")
-                        self.session_log.append(f"    -> {name}: MALICIOUS (Hits: {hits})")
+                        hits  = result.get("engines_detected", 0)
+                        total = result.get("engines_total", 0)
+                        label = f"Hits: {hits}" + (f" / {total}" if total else "")
+                        colors.critical(f"    -> {name}: MALICIOUS ({label})")
+                        self.session_log.append(f"    -> {name}: MALICIOUS ({label})")
                         malicious_sources.append(name)
+                        if name == "VirusTotal" and total:
+                            _vt_detected, _vt_total = hits, total
                     else:
-                        hits = result.get("engines_detected", 0)
-                        colors.success(f"    -> {name}: SAFE (Hits: {hits})")
-                        self.session_log.append(f"    -> {name}: SAFE (Hits: {hits})")
+                        hits  = result.get("engines_detected", 0)
+                        total = result.get("engines_total", 0)
+                        label = f"Hits: {hits}" + (f" / {total}" if total else "")
+                        colors.success(f"    -> {name}: SAFE ({label})")
+                        self.session_log.append(f"    -> {name}: SAFE ({label})")
+                        if name == "VirusTotal" and total:
+                            _vt_detected, _vt_total = hits, total
                 except Exception as e:
                     self.log_event(f"    -> {name}: ERROR ({e})")
+
+        # Quorum summary line — only when VirusTotal responded with engine totals
+        if _vt_total > 0:
+            pct = (_vt_detected / _vt_total) * 100
+            consensus = "MALICIOUS" if _vt_detected >= 3 else "SAFE"
+            quorum_line = (
+                f"[*] QUORUM: {_vt_detected} / {_vt_total} VT engines flagged "
+                f"({pct:.1f}%) — {consensus} consensus"
+            )
+            if _vt_detected >= 3:
+                colors.critical(quorum_line)
+            else:
+                colors.success(quorum_line)
+            self.session_log.append(quorum_line)
 
         if malicious_sources:
             verdict = "MALICIOUS"
@@ -528,6 +553,19 @@ Format output EXACTLY using these headers:
         if utils.is_excluded(file_path):
             self.log_event(f"[*] ALLOWLISTED: {os.path.basename(file_path)} — bypassed per policy.")
             return
+
+        # ── Priority flag ────────────────────────────────────────────────────
+        # High-priority paths (configured in Settings) are flagged so the daemon
+        # can fast-track their results — no change to scan logic, purely advisory.
+        try:
+            hp_paths = utils.load_config().get("high_priority_paths", [])
+            if any(file_path.lower().startswith(p.lower()) for p in hp_paths if p):
+                self.log_event(
+                    f"[!] HIGH PRIORITY: {os.path.basename(file_path)} "
+                    f"— matches a critical monitored path."
+                )
+        except Exception:
+            pass  # Non-critical
 
         sha256 = utils.get_sha256(file_path)
         if not sha256:
@@ -1140,7 +1178,7 @@ Format output EXACTLY using these headers:
                         try:
                             with open(filepath, "w", encoding="utf-8") as f:
                                 f.write("=" * 60 + "\n")
-                                f.write(" CYBERSENTINEL v2 — SCAN SESSION REPORT\n")
+                                f.write(" CYBERSENTINEL v1 — SCAN SESSION REPORT\n")
                                 f.write(
                                     f" Generated : {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                                 )

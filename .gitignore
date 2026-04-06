@@ -81,3 +81,6 @@ samples/
 *.zip
 *.tar.gz
 *.rar
+
+#── Exports ──────────────────────────────
+cybersentinel_export.*

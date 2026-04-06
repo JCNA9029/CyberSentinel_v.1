@@ -106,9 +106,13 @@ class VirusTotalAPI:
                     .get("last_analysis_stats", {})
                 )
                 malicious_count = stats.get("malicious", 0)
+                # Sum all engine categories to compute the quorum denominator.
+                # Keys: malicious, suspicious, harmless, undetected, timeout, failure.
+                engines_total = sum(stats.values())
                 return {
                     "verdict":          "MALICIOUS" if malicious_count >= 3 else "SAFE",
                     "engines_detected": malicious_count,
+                    "engines_total":    engines_total,
                 }
             return None
         except RequestException:
@@ -324,8 +328,8 @@ class MalwareBazaarAPI:
     _API_URL = "https://mb-api.abuse.ch/api/v1/"
     _HEADERS = {
         "User-Agent": (
-            "Mozilla/5.0 (compatible; CyberSentinel-EDR/2.0; "
-            "+https://github.com/JCNA9029/CybersentinelModularized)"
+            "Mozilla/5.0 (compatible; CyberSentinel-EDR/1.0; "
+            "+https://github.com/JCNA9029/CyberSentinel_v.1)"
         )
     }
 

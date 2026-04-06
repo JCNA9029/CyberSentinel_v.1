@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QFrame, QComboBox, QSpinBox, QGroupBox,
     QMessageBox, QProgressBar, QStackedWidget, QScrollArea,
-    QSizePolicy, QDialog, QFormLayout, QDialogButtonBox,
+    QSizePolicy, QDialog, QFormLayout, QDialogButtonBox, QListWidget
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QPropertyAnimation,
@@ -626,6 +626,10 @@ class CyberSentinelGUI(QMainWindow):
         self._refresh_timer.start(30_000)
         self._refresh_dashboard()
 
+        # Show privacy notice once on first launch — deferred so the window
+        # is fully rendered before the dialog blocks the event loop.
+        QTimer.singleShot(600, self._show_privacy_notice)
+
     # ── UI BUILD ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -821,7 +825,140 @@ class CyberSentinelGUI(QMainWindow):
 
         return sidebar
 
+    # ── PRIVACY NOTICE ────────────────────────────────────────────────────────
+
+    def _show_privacy_notice(self):
+        """
+        One-time first-run privacy disclosure explaining that only file hashes
+        (never file content) are submitted to cloud APIs.
+        Writes a marker file so it is never shown again.
+        """
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("CyberSentinel — Data Privacy Notice")
+        dlg.setFixedWidth(520)
+        dlg.setStyleSheet(f"""
+            QDialog  {{ background: {THEME['bg']}; }}
+            QLabel   {{ color: {THEME['text']}; border: none; }}
+            QPushButton {{
+                background: {THEME['surface']};
+                color: {THEME['text']};
+                border: 1px solid {THEME['border']};
+                border-radius: 4px;
+                padding: 7px 18px;
+                font-size: 12px;
+            }}
+            QPushButton#ok {{
+                background: {THEME['blue']};
+                color: #ffffff;
+                border: none;
+                font-weight: bold;
+            }}
+            QPushButton#ok:hover {{ background: #388bfd; }}
+        """)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(28, 24, 28, 20)
+        v.setSpacing(14)
+
+        # Header
+        title = QLabel("🔒  Data Privacy Notice")
+        title.setStyleSheet(
+            f"color: {THEME['blue']}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        v.addWidget(title)
+
+        # Body
+        body = QLabel(
+            "<b>What data leaves your machine?</b><br><br>"
+            "CyberSentinel submits only <b>file hashes</b> (SHA-256 / MD5) to the "
+            "following cloud services when a scan is performed:<br><br>"
+            "• &nbsp;<b>VirusTotal</b> — Multi-engine hash reputation<br>"
+            "• &nbsp;<b>AlienVault OTX</b> — Threat intelligence pulse lookup<br>"
+            "• &nbsp;<b>MetaDefender</b> — OPSWAT multi-engine hash scan<br>"
+            "• &nbsp;<b>MalwareBazaar</b> — abuse.ch confirmed malware database<br><br>"
+            "<b>No file content, metadata, or personal data is ever transmitted.</b> "
+            "A file hash cannot be reversed to reconstruct the original file. "
+            "If you are working with sensitive or classified files, you can disable "
+            "cloud lookups and rely solely on the offline ML engine (Tier 2) via "
+            "the Settings page — simply leave the API key fields empty.<br><br>"
+        )
+        body.setStyleSheet(
+            f"color: {THEME['text']}; font-size: 11px; line-height: 1.6; "
+            f"background: {THEME['surface']}; border: 1px solid {THEME['border']}; "
+            "border-radius: 4px; padding: 12px;"
+        )
+        body.setWordWrap(True)
+        v.addWidget(body)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("✓  I Understand")
+        ok_btn.setObjectName("ok")
+        ok_btn.setFixedWidth(160)
+        ok_btn.setFixedHeight(34)
+        btn_row.addWidget(ok_btn)
+        v.addLayout(btn_row)
+
+        def _accept():
+            try:
+                from modules import utils as _u
+                _u.mark_privacy_notice_shown()
+            except Exception:
+                pass
+            dlg.accept()
+
+        ok_btn.clicked.connect(_accept)
+        dlg.exec()
+
+    # ── ALLOWLIST HELPERS ─────────────────────────────────────────────────────
+
+    def _load_allowlist(self) -> list[str]:
+        """Reads exclusions.txt and returns non-comment, non-empty lines."""
+        exc_path = os.path.join(BASE_DIR, "exclusions.txt")
+        if not os.path.isfile(exc_path):
+            return []
+        try:
+            with open(exc_path, "r", encoding="utf-8") as f:
+                return [
+                    ln.strip() for ln in f
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+        except OSError:
+            return []
+
+    def _save_allowlist(self, entries: list[str]) -> bool:
+        """Writes the allowlist back to exclusions.txt, preserving the header comment."""
+        exc_path = os.path.join(BASE_DIR, "exclusions.txt")
+        try:
+            with open(exc_path, "w", encoding="utf-8") as f:
+                f.write("# CyberSentinel — File & Directory Allowlist\n")
+                f.write("# Paths or hashes listed here are bypassed by all scan engines.\n")
+                f.write("# One entry per line. Lines starting with # are comments.\n\n")
+                for entry in entries:
+                    f.write(entry + "\n")
+            return True
+        except OSError:
+            return False
+
+    # ── SIEM EXPORT ───────────────────────────────────────────────────────────
+
+    def _export_history(self, fmt: str):
+        """Prompts for a save path then exports scan_cache to JSON or CSV."""
+        from modules import utils as _u
+        ext  = "JSON Files (*.json)" if fmt == "json" else "CSV Files (*.csv)"
+        name = f"cybersentinel_export.{fmt}"
+        path, _ = QFileDialog.getSaveFileName(self, f"Export Scan History ({fmt.upper()})", name, ext)
+        if not path:
+            return
+        ok, msg = _u.export_scan_history(fmt, path)
+        if ok:
+            QMessageBox.information(self, "Export Complete", f"✅ {msg}")
+        else:
+            QMessageBox.critical(self, "Export Failed", f"❌ {msg}")
+
     def _global_save_session(self):
+
         """
         Global save session handler — callable from the sidebar at any time.
         Saves the full session log regardless of which page is currently active.
@@ -995,6 +1132,25 @@ class CyberSentinelGUI(QMainWindow):
         grp_layout = QVBoxLayout(grp)
         self._dash_table = make_table(["Timestamp", "File", "SHA-256", "Verdict"], stretch_col=1)
         grp_layout.addWidget(self._dash_table)
+
+        # SIEM export buttons — lets enterprise analysts feed logs into SIEM tools
+        export_row = QHBoxLayout()
+        export_lbl = QLabel("Export scan history for SIEM ingestion:")
+        export_lbl.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        export_json_btn = QPushButton("⬇  Export JSON")
+        export_json_btn.setMinimumWidth(130)
+        export_json_btn.setToolTip("Export all scan history as JSON (SIEM / SOAR compatible)")
+        export_json_btn.clicked.connect(lambda: self._export_history("json"))
+        export_csv_btn = QPushButton("⬇  Export CSV")
+        export_csv_btn.setMinimumWidth(130)
+        export_csv_btn.setToolTip("Export all scan history as CSV (spreadsheet / SIEM compatible)")
+        export_csv_btn.clicked.connect(lambda: self._export_history("csv"))
+        export_row.addWidget(export_lbl)
+        export_row.addStretch()
+        export_row.addWidget(export_json_btn)
+        export_row.addWidget(export_csv_btn)
+        grp_layout.addLayout(export_row)
+
         inner_layout.addWidget(grp, 1)
 
         layout.addWidget(inner, 1)
@@ -2323,7 +2479,7 @@ class CyberSentinelGUI(QMainWindow):
         self._intel_console.append_line("[+] Intel update complete.", THEME["green"])
         self._check_intel_status()
 
-    # ── PAGE: SETTINGS ────────────────────────────────────────────────────────
+   # ── PAGE: SETTINGS ────────────────────────────────────────────────────────
 
     def _build_settings_page(self):
         page = QWidget()
@@ -2334,6 +2490,11 @@ class CyberSentinelGUI(QMainWindow):
             "⚙️", "Settings",
             "API keys encrypted with Fernet AES-128 · LLM model selection · Webhook configuration"
         ))
+
+        # Create a scroll area to wrap the settings content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
 
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
@@ -2412,8 +2573,6 @@ class CyberSentinelGUI(QMainWindow):
         self._llm_combo = QComboBox()
         self._llm_combo.setEditable(False)
         self._llm_combo.setMinimumWidth(280)
-        # Set explicit font so Qt never falls back to a 0-point font
-        # when rendering the dropdown items
         self._llm_combo.setFont(QFont("Arial", 11))
         self._llm_combo.setStyleSheet(f"""
             QComboBox {{
@@ -2451,7 +2610,7 @@ class CyberSentinelGUI(QMainWindow):
         llm_layout.addLayout(combo_row)
         llm_layout.addWidget(self._llm_status_lbl)
 
-        # RAM hint label — updates when selection changes
+        # RAM hint label
         self._llm_hint_lbl = QLabel("")
         self._llm_hint_lbl.setStyleSheet(
             f"color: {THEME['green']}; font-size: 10px; font-style: italic;"
@@ -2461,12 +2620,10 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.addWidget(llm_grp)
 
         def _populate_combo(models: list, status: str):
-            """Fills the combo box, marking recommended models with hints."""
             self._llm_combo.clear()
             current = getattr(self.logic, "llm_model", "qwen2.5:3b") or "qwen2.5:3b"
             found_current = False
 
-            # Add installed models first
             for m in models:
                 rec = RECOMMENDED.get(m)
                 if rec:
@@ -2478,7 +2635,6 @@ class CyberSentinelGUI(QMainWindow):
                     self._llm_combo.setCurrentIndex(self._llm_combo.count() - 1)
                     found_current = True
 
-            # If current model not in installed list, add it as a fallback entry
             if not found_current:
                 label = f"    {current}  (currently configured)"
                 self._llm_combo.addItem(label, userData=current)
@@ -2488,7 +2644,6 @@ class CyberSentinelGUI(QMainWindow):
             _update_hint()
 
         def _update_hint():
-            """Shows RAM/quality hint for the currently selected model."""
             data = self._llm_combo.currentData()
             rec  = RECOMMENDED.get(data or "")
             if rec:
@@ -2520,21 +2675,15 @@ class CyberSentinelGUI(QMainWindow):
                 if models:
                     _populate_combo(
                         models,
-                        f"Found {len(models)} installed model(s). "
-                        f"✓ = CyberSentinel recommended."
+                        f"Found {len(models)} installed model(s). ✓ = CyberSentinel recommended."
                     )
-                    self._llm_status_lbl.setStyleSheet(
-                        f"color: {THEME['green']}; font-size: 10px;"
-                    )
+                    self._llm_status_lbl.setStyleSheet(f"color: {THEME['green']}; font-size: 10px;")
                 else:
-                    # Ollama not running or no models — show recommended list manually
                     self._llm_status_lbl.setText(
                         "⚠ Ollama not detected or no models installed. "
                         "Showing recommended models — install via 'ollama pull <model>'."
                     )
-                    self._llm_status_lbl.setStyleSheet(
-                        f"color: {THEME['yellow']}; font-size: 10px;"
-                    )
+                    self._llm_status_lbl.setStyleSheet(f"color: {THEME['yellow']}; font-size: 10px;")
                     _populate_combo(list(RECOMMENDED.keys()), "")
 
             worker.finished.connect(_done)
@@ -2543,7 +2692,6 @@ class CyberSentinelGUI(QMainWindow):
 
         scan_btn.clicked.connect(_scan_models)
 
-        # Auto-populate on page load with current model pre-selected
         _populate_combo(
             list(RECOMMENDED.keys()),
             "Click 'Scan Available Models' to detect installed models."
@@ -2562,6 +2710,135 @@ class CyberSentinelGUI(QMainWindow):
         wh_layout.addWidget(test_wh_btn)
         inner_layout.addWidget(wh_grp)
 
+        # ── Allowlist / Exclusion Manager ─────────────────────────────────────────
+        al_grp = QGroupBox("File & Directory Allowlist  (exclusions.txt)")
+        al_v = QVBoxLayout(al_grp)
+        al_v.setSpacing(8)
+
+        al_info = QLabel(
+            "Files or directories listed here are bypassed by ALL scan engines (cloud + ML). "
+            "Enter full paths (e.g. C:\\Windows\\System32\\) or SHA-256 hashes. "
+            "Useful for reducing false-positive noise on known-clean software."
+        )
+        al_info.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        al_info.setWordWrap(True)
+        al_v.addWidget(al_info)
+
+        self._allowlist_widget = QListWidget()
+        self._allowlist_widget.setMaximumHeight(120)
+        self._allowlist_widget.setStyleSheet(f"""
+            QListWidget {{
+                background: {THEME['surface']};
+                color: {THEME['text']};
+                border: 1px solid {THEME['border']};
+                border-radius: 4px;
+                font-size: 11px;
+                padding: 4px;
+            }}
+            QListWidget::item:selected {{
+                background: {THEME['blue']};
+                color: #ffffff;
+            }}
+        """)
+        for entry in self._load_allowlist():
+            self._allowlist_widget.addItem(entry)
+        al_v.addWidget(self._allowlist_widget)
+
+        al_add_row = QHBoxLayout()
+        self._allowlist_input = QLineEdit()
+        self._allowlist_input.setPlaceholderText(
+            "Add path (e.g. C:\\MyApp\\) or SHA-256 hash…"
+        )
+        al_add_btn = QPushButton("➕  Add")
+        al_add_btn.setMinimumWidth(70)
+        al_remove_btn = QPushButton("✖  Remove Selected")
+        al_remove_btn.setMinimumWidth(130)
+        al_save_btn = QPushButton("💾  Save Allowlist")
+        al_save_btn.setMinimumWidth(130)
+        al_add_row.addWidget(self._allowlist_input, 1)
+        al_add_row.addWidget(al_add_btn)
+        al_add_row.addWidget(al_remove_btn)
+        al_add_row.addWidget(al_save_btn)
+        al_v.addLayout(al_add_row)
+
+        self._allowlist_status = QLabel("")
+        self._allowlist_status.setStyleSheet(f"color: {THEME['green']}; font-size: 10px;")
+        al_v.addWidget(self._allowlist_status)
+
+        def _al_add():
+            entry = self._allowlist_input.text().strip()
+            if not entry:
+                return
+            existing = [
+                self._allowlist_widget.item(i).text()
+                for i in range(self._allowlist_widget.count())
+            ]
+            if entry not in existing:
+                self._allowlist_widget.addItem(entry)
+                self._allowlist_input.clear()
+                self._allowlist_status.setText(f"Added: {entry}")
+            else:
+                self._allowlist_status.setText("Entry already in list.")
+                self._allowlist_status.setStyleSheet(f"color: {THEME['yellow']}; font-size: 10px;")
+
+        def _al_remove():
+            for item in self._allowlist_widget.selectedItems():
+                self._allowlist_widget.takeItem(self._allowlist_widget.row(item))
+            self._allowlist_status.setStyleSheet(f"color: {THEME['green']}; font-size: 10px;")
+            self._allowlist_status.setText("Entry removed — click Save to apply.")
+
+        def _al_save():
+            entries = [
+                self._allowlist_widget.item(i).text()
+                for i in range(self._allowlist_widget.count())
+            ]
+            ok = self._save_allowlist(entries)
+            self._allowlist_status.setStyleSheet(
+                f"color: {THEME['green'] if ok else THEME['red']}; font-size: 10px;"
+            )
+            self._allowlist_status.setText(
+                f"✓ Saved {len(entries)} allowlist entries." if ok
+                else "✗ Failed to save exclusions.txt."
+            )
+
+        al_add_btn.clicked.connect(_al_add)
+        al_remove_btn.clicked.connect(_al_remove)
+        al_save_btn.clicked.connect(_al_save)
+        self._allowlist_input.returnPressed.connect(_al_add)
+        inner_layout.addWidget(al_grp)
+
+        # ── High-Priority Scan Paths ────────────────────────────────────────────
+        hp_grp = QGroupBox("High-Priority Scan Paths  (daemon)")
+        hp_v = QVBoxLayout(hp_grp)
+        hp_info = QLabel(
+            "Paths listed here are scanned before any other files when the real-time "
+            "daemon is active. Use for critical directories like System32. One path per line."
+        )
+        hp_info.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        hp_info.setWordWrap(True)
+        hp_v.addWidget(hp_info)
+
+        from modules import utils as _utils
+        _cfg_now = _utils.load_config()
+        self._hp_paths_edit = QTextEdit()
+        self._hp_paths_edit.setMaximumHeight(80)
+        self._hp_paths_edit.setPlaceholderText(
+            "C:\\Windows\\System32\\\nC:\\Users\\Public\\"
+        )
+        self._hp_paths_edit.setStyleSheet(f"""
+            QTextEdit {{
+                background: {THEME['surface']};
+                color: {THEME['text']};
+                border: 1px solid {THEME['border']};
+                border-radius: 4px;
+                font-size: 11px;
+                padding: 4px;
+            }}
+        """)
+        self._hp_paths_edit.setPlainText("\n".join(_cfg_now.get("high_priority_paths", [])))
+        hp_v.addWidget(self._hp_paths_edit)
+        inner_layout.addWidget(hp_grp)
+
         # Save
         save_btn = QPushButton("💾  Save Configuration")
         save_btn.setObjectName("primary")
@@ -2574,7 +2851,12 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.addWidget(self._settings_status)
         inner_layout.addStretch()
 
-        layout.addWidget(inner, 1)
+        # Set the inner widget inside the scroll area
+        scroll_area.setWidget(inner)
+        
+        # Add scroll area to the main page layout instead of the inner widget directly
+        layout.addWidget(scroll_area, 1)
+        
         return page
 
     def _save_settings(self):
@@ -2590,10 +2872,14 @@ class CyberSentinelGUI(QMainWindow):
         selected_model = self._llm_combo.currentData() or self._llm_combo.currentText().strip()
         if selected_model:
             self.logic.llm_model = selected_model
+        # Persist high-priority paths (split on newlines, strip blanks)
+        hp_raw = self._hp_paths_edit.toPlainText()
+        hp_paths = [p.strip() for p in hp_raw.splitlines() if p.strip()]
         _utils.save_config(
             self.logic.api_keys,
             self.logic.webhook_url,
             self.logic.llm_model,
+            high_priority_paths=hp_paths,
         )
         self._settings_status.setText(
             f"[+] Configuration saved — LLM: {self.logic.llm_model}"
@@ -3181,6 +3467,11 @@ class CyberSentinelGUI(QMainWindow):
             "Self-correcting ML with label-poisoning protection — review corrections before they train"
         ))
 
+        # Create a scroll area to wrap the adaptive learning content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(24, 20, 24, 20)
@@ -3375,7 +3666,12 @@ class CyberSentinelGUI(QMainWindow):
         )
         inner_layout.addWidget(self._al_console)
 
-        layout.addWidget(inner, 1)
+        # Set the inner widget inside the scroll area
+        scroll_area.setWidget(inner)
+
+        # Add scroll area to the main page layout instead of the inner widget directly
+        layout.addWidget(scroll_area, 1)
+
         QTimer.singleShot(200, self._refresh_adaptive)
         return page
 
@@ -3966,6 +4262,11 @@ class CyberSentinelGUI(QMainWindow):
             "Statistical detection of ML model degradation — Page-Hinkley Test"
         ))
 
+        # Create a scroll area to wrap the drift monitor content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
         inner = QWidget()
         il = QVBoxLayout(inner)
         il.setContentsMargins(24, 20, 24, 20)
@@ -4036,7 +4337,12 @@ class CyberSentinelGUI(QMainWindow):
         g2l.addWidget(self._drift_score_table)
         il.addWidget(grp2, 1)
 
-        layout.addWidget(inner, 1)
+        # Set the inner widget inside the scroll area
+        scroll_area.setWidget(inner)
+
+        # Add scroll area to the main page layout instead of the inner widget directly
+        layout.addWidget(scroll_area, 1)
+        
         QTimer.singleShot(300, self._refresh_drift)
         return page
 
