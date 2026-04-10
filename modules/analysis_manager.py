@@ -21,9 +21,8 @@ import os
 import datetime
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import ollama
-
+import requests as _requests
+import re
 from .loading import Spinner
 from .quarantine import quarantine_file
 from .ml_engine import LocalScanner
@@ -35,6 +34,79 @@ from . import network_isolation
 from . import utils
 from . import colors
 
+# ==========================================
+# 🧠 CYBERSENTINEL THREAT SCORING ENGINE
+# ==========================================
+
+# 1. Master Risk Weights (Copied from your training script)
+TECHNIQUE_WEIGHTS = {
+    "T1486": 10, "T1485": 10, "T1003": 10, "T1055.012": 10, "T1548.002": 9,
+    "T1055": 9,  "T1078": 9,  "T1489": 9,  "T1021": 8,      "T1041": 8,
+    "T1020": 8,  "T1574.001": 8, "T1547.001": 8, "T1071": 8, "T1573": 8,
+    "T1059": 7,  "T1105": 7,  "T1543": 7,  "T1497": 5,      "T1027": 5,
+    "T1112": 4,  "T1140": 4,  "T1119": 4,  "T1082": 2,      "T1083": 2,
+    "T1033": 2,  "T1012": 2,  "T1007": 1
+}
+
+# 2. Threat Intelligence Mapping
+api_context = {
+    'NtResumeThread': {'mitre_mapping': 'T1055.012'},
+    'CreateProcessInternalW': {'mitre_mapping': 'T1543'},
+    'NtTerminateProcess': {'mitre_mapping': 'T1489'},
+    'CreateRemoteThread': {'mitre_mapping': 'T1055.002'},
+    'NtCreateThreadEx': {'mitre_mapping': 'T1055'},
+    'NtAllocateVirtualMemory': {'mitre_mapping': 'T1055'},
+    'LdrLoadDll': {'mitre_mapping': 'T1574.001'},
+    'NtProtectVirtualMemory': {'mitre_mapping': 'T1055'},
+    'WriteProcessMemory': {'mitre_mapping': 'T1055'},
+    'RegSetValueExA': {'mitre_mapping': 'T1547.001'},
+    'RegCreateKeyExW': {'mitre_mapping': 'T1112'},
+    'NtQueryValueKey': {'mitre_mapping': 'T1012'},
+    'WSAStartup': {'mitre_mapping': 'T1071'},
+    'socket': {'mitre_mapping': 'T1041'},
+    'InternetOpenUrlA': {'mitre_mapping': 'T1105'},
+    'IsDebuggerPresent': {'mitre_mapping': 'T1497.001'},
+    'NtDelayExecution': {'mitre_mapping': 'T1497.003'},
+    'NtCreateFile': {'mitre_mapping': 'T1486'},
+    'FindFirstFileExW': {'mitre_mapping': 'T1083'},
+    'GetSystemWindowsDirectoryW': {'mitre_mapping': 'T1082'},
+    'CryptAcquireContextW': {'mitre_mapping': 'T1486'},
+    'CryptCreateHash': {'mitre_mapping': 'T1573'},
+    # Add your thesis-specific APIs here
+    'VirtualAllocEx': {'mitre_mapping': 'T1055'},
+    'GetKeyboardState': {'mitre_mapping': 'T1056.001'},
+    'SetWindowsHookExA': {'mitre_mapping': 'T1056.001'}
+}
+
+def calculate_live_dss(api_list, file_path):
+    if not api_list:
+        return 0.5 
+            
+    unique_techs = set()
+    for api in api_list:
+        if api in api_context:
+            mitre_full = api_context[api].get('mitre_mapping', 'Uncategorized')
+            if mitre_full != 'Uncategorized':
+                # Extract base technique ID (e.g., "T1055")
+                base_tech = mitre_full.split(' ')[0]
+                unique_techs.add(base_tech)
+    
+    # Check if we found anything after the full loop
+    if not unique_techs:
+        return 1.0 # Suspicious activity, but no mapped techniques
+
+    # Sum weights for all unique techniques found
+    raw_score = sum(TECHNIQUE_WEIGHTS.get(tid, 3) for tid in unique_techs)
+    
+    # Masquerading Penalty (+1.5 to final score)
+    filename = os.path.basename(file_path).lower()
+    system_names = ["svchost.exe", "explorer.exe", "dllhost.exe", "services.exe", "lsass.exe", "autoclickers.exe"]
+    if filename in system_names and "system32" not in file_path.lower():
+        raw_score += 7.5 # (7.5 / 50 * 10 = 1.5 penalty)
+        
+    # NORMALIZATION: 25 is the new 'Full Chain' threshold
+    normalized_score = (raw_score / 25) * 10
+    return min(10.0, round(normalized_score, 1))
 
 class ScannerLogic:
     """Orchestrates the Multi-Tier Pipeline: Cache → Cloud → ML → LLM → Containment."""
@@ -43,7 +115,9 @@ class ScannerLogic:
         config = utils.load_config()
         self.api_keys      = config.get("api_keys", {})
         self.webhook_url   = config.get("webhook_url", "")
-        self.llm_model     = config.get("llm_model", "qwen2.5:3b")
+        # Model is hardcoded — CyberSentinel uses its own fine-tuned domain analyst.
+        # Do NOT make this configurable; the model is purpose-built for this pipeline.
+        self.llm_model     = "cybersentinel2"
         self.ml_scanner    = LocalScanner()
         self.session_log: list[str] = []
         self.headless_mode = False
@@ -73,7 +147,11 @@ class ScannerLogic:
     def log_event(self, message: str, print_to_screen: bool = True):
         """Appends a message to the session log and optionally prints it."""
         if print_to_screen:
-            print(message)
+            try:
+                if sys.stdout is not None:
+                    print(message)
+            except Exception:
+                pass
         self.session_log.append(message)
 
     # ─────────────────────────────────────────────
@@ -177,83 +255,270 @@ class ScannerLogic:
             return self._run_tier1_concurrent(file_hash)
         return key_map[engine_name]()
 
+
     # ─────────────────────────────────────────────
     #  TIER 3: LLM ANALYST
     # ─────────────────────────────────────────────
 
-    def generate_llm_report(
-        self,
-        family_name: str,
-        detected_apis: list,
-        file_path: str,
-        confidence_score: float,
-        sha256: str,
-        file_size_mb: float,
-    ) -> str:
-        """Queries the local Ollama LLM and returns a formatted triage report."""
+    def generate_llm_report(self, family_name, detected_apis, file_path, confidence_score, sha256, file_size_mb):
+        # ── Pre-compute all deterministic values ──────────────────────────────
+        # These are ground-truth values owned by Python. The LLM never writes
+        # any of these — it only generates behavioral narrative sections.
         max_apis = 50
         if detected_apis:
-            api_context = "\n".join([f"- {api}" for api in detected_apis[:max_apis]])
+            extracted_api_text = "\n".join(
+                f"- {api}" for api in detected_apis[:max_apis]
+            )
             if len(detected_apis) > max_apis:
-                api_context += f"\n- ... and {len(detected_apis) - max_apis} more."
+                extracted_api_text += f"\n- ... and {len(detected_apis) - max_apis} more."
         else:
-            api_context = "None extracted. Likely API hashing, dynamic loading, or UPX packing."
+            extracted_api_text = "None extracted. Likely API hashing or packing."
 
-        family_context = family_name + (
-            " (Heuristic match — focus on behavioral APIs.)"
-            if "Family ID #" in family_name
-            else ""
+        live_dss        = calculate_live_dss(detected_apis, file_path)
+        live_confidence = int((live_dss / 10.0) * 100)
+
+        if live_dss >= 8.0:
+            triage_priority = "CRITICAL"
+        elif live_dss >= 6.0:
+            triage_priority = "HIGH"
+        elif live_dss >= 4.0:
+            triage_priority = "MEDIUM"
+        else:
+            triage_priority = "LOW"
+
+        # Sanitize path — strip analyst username before any external use
+        sanitized_path = re.sub(r'(?i)(Users\\\\)[^\\\\]+', r'\\1<analyst>', file_path)
+
+        # ── Deterministic report header ───────────────────────────────────────
+        report_header = (
+            f"\n--------------------------------------------------\n"
+            f"🔍 CYBERSENTINEL ANALYST REPORT\n"
+            f"--------------------------------------------------\n"
+            f"Target File      : {os.path.basename(file_path)}\n"
+            f"Target SHA256    : {sha256}\n"
+            f"File Size        : {file_size_mb:.2f} MB\n"
+            f"Classification   : {family_name}\n"
+            f"DSS Score        : {live_dss}/10\n"
+            f"Triage Priority  : {triage_priority}\n"
+            f"Detected APIs    :\n"
+            f"{extracted_api_text}\n"
+            f"--------------------------------------------------\n"
         )
 
-        prompt = f"""
-[SYSTEM: EDR TRIAGE REPORT GENERATION]
-Target File    : {os.path.basename(file_path)}
-Target SHA256  : {sha256}
-File Size      : {file_size_mb:.2f} MB
-Classification : {family_context}
-AI Confidence  : {confidence_score:.2f}%
-Detected APIs  : {'YES — see list below' if detected_apis else 'NONE (file may be packed, obfuscated, or a script)'}
-{api_context}
+        # ── Deterministic KQL generator ───────────────────────────────────────
+        # Maps known APIs to Microsoft Defender for Endpoint ActionType values.
+        # This is the source of truth — the LLM is never trusted to write KQL.
+        _API_TO_ACTION: dict[str, str] = {
+            "VirtualAllocEx":           "VirtualAllocApiCall",
+            "NtAllocateVirtualMemory":  "VirtualAllocApiCall",
+            "WriteProcessMemory":       "WriteProcessMemoryApiCall",
+            "NtProtectVirtualMemory":   "ModifyMemoryProtection",
+            "OpenProcess":              "OpenProcessApiCall",
+            "CreateRemoteThread":       "CreateRemoteThreadApiCall",
+            "NtCreateThreadEx":         "CreateRemoteThreadApiCall",
+            "NtResumeThread":           "ResumeThread",
+            "SetWindowsHookExA":        "SetWindowsHookApiCall",
+            "GetKeyboardState":         "GetAsyncKeyStateApiCall",
+            "LdrLoadDll":               "ImageLoaded",
+            "RegSetValueExA":           "RegistryValueSet",
+            "RegCreateKeyExW":          "RegistryKeyCreated",
+            "NtCreateFile":             "FileCreated",
+            "InternetOpenUrlA":         "NetworkConnectionEvents",
+            "WSAStartup":               "NetworkConnectionEvents",
+            "socket":                   "NetworkConnectionEvents",
+            "CryptAcquireContextW":     "CryptoApiCall",
+            "CryptCreateHash":          "CryptoApiCall",
+        }
 
-TASK: Generate a highly technical malware triage report for a Tier 2 SOC Analyst.
-Do not use conversational filler. Do not introduce yourself. Be concise and factual.
+        def generate_deterministic_kql(file_name: str, api_list: list) -> str:
+            """Generates a correct DeviceEvents KQL query from the detected API list."""
+            if not api_list:
+                return ""
+            action_types = sorted({
+                f'"{_API_TO_ACTION[api]}"'
+                for api in api_list
+                if api in _API_TO_ACTION
+            })
+            if not action_types:
+                return ""
+            safe_name   = file_name.replace('"', "")
+            actions_str = ", ".join(action_types)
+            return (
+                f"\n### 📊 SIEM/EDR Detection (Deterministic)\n"
+                f"**KQL — Microsoft Defender for Endpoint:**\n"
+                f"DeviceEvents\n"
+                f"| where InitiatingProcessFileName =~ \"{safe_name}\"\n"
+                f"| where ActionType in ({actions_str})\n"
+                f"| project TimeGenerated, DeviceName, ActionType,\n"
+                f"          InitiatingProcessFileName, InitiatingProcessFolderPath,\n"
+                f"          AccountName\n"
+                f"| order by TimeGenerated desc\n"
+            )
 
-{'If specific APIs are listed, explain EXACTLY how they chain to perform malicious actions and map to MITRE ATT&CK.' if detected_apis else 'No APIs were extracted. Focus the analysis on what the absence of APIs implies (packing, obfuscation, non-PE file type) and what dynamic analysis steps are recommended.'}
+        def generate_deterministic_yara(file_name: str, api_list: list) -> str:
+            """Generates a behaviorally-sound YARA rule from the detected API list."""
+            if not api_list:
+                return ""
+            rule_name     = re.sub(r'[^a-zA-Z0-9]', '_', file_name.rsplit('.', 1)[0])
+            strings_lines = [
+                f'        $api{i} = "{api}" ascii wide'
+                for i, api in enumerate(api_list)
+            ]
+            strings_block = "\n".join(strings_lines)
+            return (
+                f"\n### 🎯 Resilient YARA Rule (Auto-Generated)\n"
+                f"rule Detect_{rule_name} {{\n"
+                f"    meta:\n"
+                f'        description = "Behavioral detection for {file_name}"\n'
+                f'        severity    = "{triage_priority}"\n'
+                f'        dss_score   = "{live_dss}/10"\n'
+                f"    strings:\n"
+                f"{strings_block}\n"
+                f"    condition:\n"
+                f"        uint16(0) == 0x5A4D and any of ($api*)\n"
+                f"}}"
+            )
 
-Format output EXACTLY using these headers:
+        # ── LLM prompt ────────────────────────────────────────────────────────
+        # The model was trained on a fixed output format that includes KQL and
+        # YARA. We cannot override that via prompting alone — the training
+        # weights dominate. Strategy: ask only for narrative sections, add stop
+        # tokens to halt generation before structured blocks, then strip and
+        # replace any structured output that slips through with deterministic
+        # Python-generated versions. The LLM handles what it is good at —
+        # behavioral narrative and attack maneuver grouping.
+        system_msg = (
+            "You are CyberSentinel Pro, a Tier-3 Malware Research Assistant. "
+            "Provide high-fidelity behavioral analysis for SOC environments.\n\n"
+            "OUTPUT EXACTLY THESE SECTIONS IN ORDER — NOTHING ELSE:\n"
+            "1. ### 🛡️ CyberSentinel High-Fidelity Verdict\n"
+            "   One paragraph executive summary. State verdict label only — no scores or percentages.\n"
+            "2. ### ⚔️ Attack Maneuvers (Behavioral Analysis)\n"
+            "   Group APIs into named maneuvers. Use full MITRE sub-technique IDs (e.g. T1055.001).\n"
+            "3. ### 💥 Blast Radius\n"
+            "   One paragraph on maximum potential impact if the threat executes fully.\n"
+            "4. ### 🕵️ Forensic Artifacts (Hunt List)\n"
+            "   Specific file paths, registry keys, memory indicators.\n\n"
+            "STOP after Forensic Artifacts. Do NOT write KQL, SIEM queries, or YARA rules."
+        )
 
-### 🔴 Threat Classification
-(1-2 sentences: core threat type and detection mechanism.)
+        real_user = (
+            f"--- [START OF TELEMETRY] ---\n"
+            f"EXECUTION CONTEXT:\n"
+            f"- Filename: {os.path.basename(file_path)}\n"
+            f"- Full Path: {sanitized_path}\n"
+            f"- File Size: {file_size_mb:.2f} MB\n"
+            f"THREAT METADATA:\n"
+            f"- Classification: {family_name}\n"
+            f"- DSS Score: {live_dss}/10\n"
+            f"- Triage Priority: {triage_priority}\n"
+            f"API TELEMETRY TRACE:\n"
+            f"{chr(44).join(detected_apis) if detected_apis else 'NONE'}\n"
+            f"--- [END OF TELEMETRY] ---"
+        )
 
-### ⚙️ API Behavioral Analysis
-{'(Technical intent behind each API detected, with MITRE ATT&CK mapping.)' if detected_apis else '(Explain why no APIs were found: packing, API hashing, dynamic loading, or non-PE. Do NOT fabricate API analysis that was not observed.)'}
+        _OLLAMA_URL      = "http://127.0.0.1:11434/api/chat"
+        _CONNECT_TIMEOUT = 15
+        _READ_TIMEOUT    = None
 
-### ⚠️ System Impact & Risk
-(Concrete impact: data exfiltration, persistence, lateral movement potential.)
-
-### 🛡️ Recommended Mitigation
-(Actionable technical steps beyond standard quarantine.)
-
-### 🎯 Generated YARA Rule
-{'(Write a YARA rule using the specific API strings above as detection strings. The condition must require the PE magic byte AND at least 2 of the API strings. Example: uint16(0) == 0x5A4D and 2 of ($api*))' if detected_apis else '(No meaningful YARA rule can be generated without detected API strings. Write a brief YARA rule that uses file size and entropy as heuristics instead, and add a comment explaining that a behaviour-based rule requires dynamic analysis. Do NOT use only the MZ magic byte as the condition — that would match every PE file on the system.)'}
-"""
-
+        payload = {
+            "model":    self.llm_model,
+            "messages": [{"role": "user", "content": real_user}],
+            "system":   system_msg,
+            "options": {
+                "temperature": 0.1,
+                "num_ctx":     4096,
+                "num_predict": 600,
+                # Stop tokens — halt generation before the model writes structured blocks
+                "stop": [
+                    "<|im_end|>",
+                    "### 📊",
+                    "### 🎯",
+                    "DeviceImageLoadEvents",
+                    "DeviceEvents\n|",
+                    "rule Detect_",
+                    "```kql",
+                    "```yara",
+                    "```KQL",
+                ]
+            },
+            "stream": True,
+        }
 
         try:
-            response = ollama.chat(
-                model=self.llm_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a strictly analytical, automated Endpoint Detection and Response (EDR) triage engine.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                options={"temperature": 0.2},
+            import json as _json
+            tokens: list[str] = []
+
+            with _requests.post(
+                _OLLAMA_URL,
+                json=payload,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        chunk = _json.loads(raw_line)
+                    except ValueError:
+                        continue
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        tokens.append(token)
+                    if chunk.get("done"):
+                        break
+
+            # ── Post-process LLM output ───────────────────────────────────────
+            # Safety net: strip any structured blocks the model generated despite
+            # stop tokens (quantized models can be unpredictable). Everything
+            # from SIEM/YARA sections onward is removed and replaced with the
+            # deterministic Python-generated versions below.
+            ai_text = "".join(tokens)
+
+            for pattern in (
+                r"### 📊.*",
+                r"### 🎯.*",
+                r"```kql.*?```",
+                r"```yara.*?```",
+                r"```kql.*",
+                r"```KQL.*",
+                r"DeviceImageLoadEvents.*",
+                r"rule Detect_.*",
+            ):
+                ai_text = re.sub(pattern, "", ai_text, flags=re.DOTALL | re.IGNORECASE)
+
+            ai_text = ai_text.rstrip()
+
+            # ── Assemble final report ─────────────────────────────────────────
+            # Deterministic Header → LLM Narrative → Deterministic KQL → Deterministic YARA
+            kql_block  = generate_deterministic_kql(os.path.basename(file_path), detected_apis)
+            yara_block = generate_deterministic_yara(os.path.basename(file_path), detected_apis)
+
+            return report_header + "\n" + ai_text + "\n" + kql_block + "\n" + yara_block
+
+        except _requests.exceptions.ConnectionError:
+            return (
+                "[-] CyberSentinel Analyst Offline: Ollama is not running.\n"
+                "    Start Ollama, then retry the AI analyst report."
             )
-            return response["message"]["content"]
+        except _requests.exceptions.Timeout:
+            return (
+                "[-] Ollama did not respond within 15s.\n"
+                "    Ensure Ollama is running: open a terminal and run 'ollama serve'."
+            )
+        except _requests.exceptions.HTTPError as e:
+            status = getattr(resp, "status_code", "?")
+            if status == 404:
+                return (
+                    "[-] Model 'cybersentinel2' not found in Ollama.\n"
+                    "    Run: ollama create cybersentinel2 -f Modelfile"
+                )
+            return f"[-] Ollama API error ({status}): {e}"
+        except (KeyError, ValueError) as e:
+            return f"[-] Unexpected response format from Ollama: {e}"
         except Exception as e:
-            return f"[-] LLM Analyst Offline: {e}"
+            return f"[-] CyberSentinel Analyst error: {e}"
 
     # ─────────────────────────────────────────────
     #  TIER 4: CONTAINMENT & QUARANTINE
