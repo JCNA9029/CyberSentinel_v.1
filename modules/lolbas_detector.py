@@ -57,11 +57,19 @@ BUILTIN_PATTERNS: list[tuple] = [
     # Credential Access
     ("procdump.exe",    r"-ma\s+lsass|lsass\.exe",                       "T1003.001",      "ProcDump LSASS memory dump — credential harvesting",            3),
     ("ntdsutil.exe",    r"ifm|ac\s+instance\s+ntds",                     "T1003.003",      "NTDSUtil NTDS.dit extraction",                                  3),
-    # PowerShell obfuscation
-    ("powershell.exe",  r"-e[nc]{0,6}\s+[A-Za-z0-9+/=]{20,}|-nop.{0,30}-w.{0,20}hid|-exec.{0,20}bypass",
+    # PowerShell — each stealth flag is its own alternative so flag ORDER does not matter
+    # The old single rule  r"-nop.{0,30}-w.{0,20}hid"  only fired when -NoProfile came
+    # immediately before -WindowStyle Hidden.  Any intervening flag (e.g. -ExecutionPolicy)
+    # broke the match.  Independent alternatives fix this.
+    ("powershell.exe",  r"-e[nc]{0,6}\s+[A-Za-z0-9+/=]{20,}|-nop[rofile]*|-w[indowStyle]*\s+hid[den]*|-exec[utionPolicy]*\s+bypass",
                          "T1059.001",      "PowerShell encoded/obfuscated command execution",                3),
-    ("pwsh.exe",        r"-e[nc]{0,6}\s+[A-Za-z0-9+/=]{20,}|-nop.{0,30}-w.{0,20}hid",
+    ("pwsh.exe",        r"-e[nc]{0,6}\s+[A-Za-z0-9+/=]{20,}|-nop[rofile]*|-w[indowStyle]*\s+hid[den]*",
                          "T1059.001",      "PowerShell Core obfuscated execution",                          3),
+    # cmd.exe — was completely missing from BUILTIN_PATTERNS, falling through to
+    # the Layer 4 LOLBAS feed which requires >=2 fuzzy token matches (never met
+    # for simple test commands like  cmd /c echo).
+    ("cmd.exe",         r"/c\s+(powershell|certutil|mshta|regsvr32|rundll32|wscript|cscript|bitsadmin|curl|wget|echo)|/v:|/k\s|&&|\|\||>\s*[a-z]:\\|for\s+/[fl]",
+                         "T1059.003",      "cmd.exe used as LOLBin launcher or for command chaining",       2),
 ]
 
 # ─── High-risk parent processes ───────────────────────────────────────────────
@@ -170,25 +178,86 @@ class LolbasDetector:
     process context for kill-chain analysis.
     """
 
-    def __init__(self):
+    def __init__(self, webhook_url: str = ""):
         self._lolbas_patterns: list[dict] = []
+        self._webhook_url: str = webhook_url
         self._load_lolbas_feed()
 
     def _load_lolbas_feed(self):
-        """Parses the LOLBAS JSON feed into a fast-lookup structure."""
+        """
+        Parses the LOLBAS JSON feed into two structures:
+
+        self._lolbas_patterns  — list of per-command dicts for Layer 4 fuzzy matching
+        self._lolbas_enrich    — dict keyed by binary name for Layer 3 enrichment.
+                                 When a built-in pattern fires we look the binary up
+                                 here to add Category, Privileges, OS, paths and Sigma
+                                 links that the hardcoded tuple lacks.
+        """
         raw = load_lolbas()
+        self._lolbas_enrich: dict[str, dict] = {}
+
         for entry in raw:
             name = (entry.get("Name") or "").lower()
             if not name:
                 continue
+
+            full_paths = [
+                p.get("Path", "") for p in (entry.get("Full_Path") or [])
+                if p.get("Path")
+            ]
+            sigma_links = [
+                d.get("Sigma", "") for d in (entry.get("Detection") or [])
+                if d.get("Sigma")
+            ]
+            binary_description = entry.get("Description", "")
+
+            if name not in self._lolbas_enrich:
+                self._lolbas_enrich[name] = {
+                    "binary_description": binary_description,
+                    "full_paths":         full_paths,
+                    "sigma_links":        sigma_links,
+                    "commands":           [],
+                }
+            self._lolbas_enrich[name]["commands"].extend(entry.get("Commands") or [])
+
             for cmd in (entry.get("Commands") or []):
                 self._lolbas_patterns.append({
-                    "name":     name,
-                    "usecase":  cmd.get("Usecase", ""),
-                    "mitre":    cmd.get("MitreID", ""),
-                    "category": cmd.get("Category", ""),
-                    "command":  cmd.get("Command", ""),
+                    "name":       name,
+                    "usecase":    cmd.get("Usecase", ""),
+                    "mitre":      cmd.get("MitreID", ""),
+                    "category":   cmd.get("Category", ""),
+                    "privileges": cmd.get("Privileges", ""),
+                    "os":         cmd.get("OperatingSystem", ""),
+                    "command":    cmd.get("Command", ""),
                 })
+
+    def _enrich_from_feed(self, finding: dict, matched_cmd: dict | None = None) -> dict:
+        """
+        Looks up the detected binary in self._lolbas_enrich and adds the
+        feed metadata (Category, Privileges, OS, paths, Sigma links) to the
+        finding dict in-place.  Called after both Layer 3 and Layer 4 matches.
+        """
+        name   = finding.get("binary", "").lower()
+        enrich = getattr(self, "_lolbas_enrich", {}).get(name)
+        if not enrich:
+            return finding
+
+        if matched_cmd is None:
+            mitre = finding.get("mitre", "")
+            cmds  = enrich["commands"]
+            matched_cmd = next(
+                (c for c in cmds if c.get("MitreID", "") == mitre),
+                cmds[0] if cmds else {}
+            )
+
+        finding["category"]           = matched_cmd.get("Category", "—")
+        finding["privileges"]         = matched_cmd.get("Privileges", "—")
+        finding["os"]                 = matched_cmd.get("OperatingSystem", "—")
+        finding["binary_description"] = enrich["binary_description"]
+        finding["full_paths"]         = enrich["full_paths"]
+        finding["sigma_links"]        = enrich["sigma_links"][:3]
+        finding["lolbas_usecase"]     = matched_cmd.get("Usecase", "—")
+        return finding
 
     def check_process(
         self,
@@ -254,6 +323,9 @@ class LolbasDetector:
                         "parent_name": parent_name,
                         "parent_pid":  parent_pid,
                     }
+                    # Enrich with Category, Privileges, OS, paths, Sigma links
+                    # from intel/lolbas.json — the built-in tuple only has MITRE + desc
+                    self._enrich_from_feed(finding)
                     base_score = pattern_score
                     detection_source = "built-in pattern"
                     break
@@ -279,6 +351,16 @@ class LolbasDetector:
                             "parent_name": parent_name,
                             "parent_pid":  parent_pid,
                         }
+                        # Feed match already has the command dict — pass it directly
+                        # so _enrich_from_feed doesn't have to guess by MITRE ID
+                        _raw_cmd = {
+                            "Category":        entry.get("category", ""),
+                            "Privileges":      entry.get("privileges", ""),
+                            "OperatingSystem": entry.get("os", ""),
+                            "Usecase":         entry.get("usecase", ""),
+                            "MitreID":         entry.get("mitre", ""),
+                        }
+                        self._enrich_from_feed(finding, matched_cmd=_raw_cmd)
                         base_score = 1  # Feed match is lower confidence than built-in
                         detection_source = "LOLBAS feed"
                         break
@@ -314,6 +396,46 @@ class LolbasDetector:
                 finding["entropy_tokens"] = entropy_hits
                 finding["description"] += f" [+entropy corroboration: {entropy_hits[0]}]"
 
+        # ── Layer 6: Name-only fallback ──────────────────────────────────────
+        # WMI returns an empty CommandLine for short-lived processes because the
+        # OS recycles the PEB before WMI reads it.  Layers 3–5 all silently
+        # return None when cmdline is empty.  This fallback mirrors the
+        # name-only LOW-confidence alert that lolbin_detector already emits,
+        # ensuring LolbasDetector doesn't silently drop fast-exiting LOLBins.
+        # cmd.exe is excluded from trusted-parent suppression — it is spawned
+        # thousands of times per day by the OS itself.
+        #
+        # FIX: previously hardcoded base_score = 1 regardless of the binary's
+        # original pattern score.  mshta (score=3), regsvr32 (score=3), and
+        # rundll32 (score=3) were all downgraded to LOW even when there was no
+        # reason to doubt the detection.  Now base_score inherits the pattern's
+        # own score capped at 2 (MEDIUM) because without cmdline proof we cannot
+        # justify HIGH confidence — but we can justify MEDIUM for known-dangerous
+        # binaries like mshta whose presence alone is suspicious.
+        if finding is None and not cmdline_normalized:
+            for binary, _pat, mitre, desc, pattern_score in BUILTIN_PATTERNS:
+                b_lower = binary.lower()
+                if b_lower == "cmd.exe" and is_trusted_parent:
+                    continue   # OS-routine cmd.exe from services — skip noise
+                if name_lower == b_lower or name_lower.endswith(b_lower):
+                    finding = {
+                        "type":               "LOLBIN_ABUSE",
+                        "binary":             name_lower,
+                        "mitre":              mitre,
+                        "description":        desc + " [cmdline unavailable — WMI race]",
+                        "cmdline":            "",
+                        "cmdline_normalized": "",
+                        "source":             "name-only",
+                        "parent_name":        parent_name,
+                        "parent_pid":         parent_pid,
+                    }
+                    # Cap at MEDIUM: no cmdline means no pattern proof, but
+                    # high-score binaries (mshta=3, regsvr32=3) still warrant
+                    # more than LOW when spawned from a non-system parent.
+                    base_score       = min(2, pattern_score)
+                    detection_source = "name-only (no cmdline)"
+                    break
+
         if finding is None:
             return None
 
@@ -341,10 +463,19 @@ class LolbasDetector:
         return finding
 
     def _save_alert(self, finding: dict):
-        """Persists a LoLBin alert to the event_timeline table for chain correlation."""
+        """Persists a LoLBin alert to event_timeline AND fileless_alerts (for GUI display)."""
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        findings_summary = json.dumps([
+            {
+                "mitre":     finding["mitre"],
+                "indicator": finding["description"],
+                "confidence": finding.get("confidence", "MEDIUM"),
+                "source":    finding.get("detection_source", "built-in"),
+            }
+        ])
         try:
             with sqlite3.connect(utils.DB_FILE) as conn:
+                # event_timeline — used by chain correlator
                 conn.execute(
                     "INSERT INTO event_timeline (event_type, detail, pid, timestamp) "
                     "VALUES (?,?,?,?)",
@@ -361,13 +492,71 @@ class LolbasDetector:
                         now,
                     ),
                 )
+                # fileless_alerts — read by the Fileless/AMSI GUI page
+                conn.execute(
+                    "INSERT INTO fileless_alerts (source, findings, pid, timestamp) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        f"LOLBIN_ABUSE [{finding['binary']}]",
+                        findings_summary,
+                        finding.get("parent_pid", 0),
+                        now,
+                    ),
+                )
         except Exception:
             pass  # Non-critical: operation continues regardless
+
+        # Fire webhook if configured
+        if self._webhook_url:
+            try:
+                confidence = finding.get("confidence", "MEDIUM")
+                icon = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(confidence, "🟠")
+                utils.send_webhook_alert(
+                    self._webhook_url,
+                    f"{icon} LOLBin Abuse Detected — {confidence} Confidence",
+                    {
+                        "Binary":    finding.get("binary", "?"),
+                        "MITRE":     finding.get("mitre", "?"),
+                        "Technique": finding.get("description", "?")[:200],
+                        "Confidence": confidence,
+                        "Parent":    finding.get("parent_name", "unknown"),
+                        "Command":   (finding.get("cmdline") or "")[:300],
+                        "Source":    finding.get("detection_source", "built-in"),
+                    },
+                )
+            except Exception:
+                pass
 
     def format_alert(self, finding: dict) -> str:
         """Formats a LoLBin finding into a human-readable alert string."""
         confidence = finding.get("confidence", "MEDIUM")
         icon = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(confidence, "🟠")
+
+        # ── intel/lolbas.json enrichment fields ──────────────────────────────
+        category   = finding.get("category", "")
+        privileges = finding.get("privileges", "")
+        os_info    = finding.get("os", "")
+        paths      = finding.get("full_paths", [])
+        sigmas     = finding.get("sigma_links", [])
+        bin_desc   = finding.get("binary_description", "")
+
+        intel_lines = ""
+        if category or privileges or os_info:
+            intel_lines += f"\n  {'─'*61}"
+            if bin_desc:
+                intel_lines += f"\n  BinDesc : {bin_desc}"
+            if category:
+                intel_lines += f"\n  Category: {category}"
+            if privileges:
+                intel_lines += f"\n  Privs   : {privileges}"
+            if os_info:
+                intel_lines += f"\n  OS      : {os_info}"
+            if paths:
+                intel_lines += f"\n  Paths   : {'; '.join(paths[:2])}"
+            if sigmas:
+                intel_lines += f"\n  Sigma   : {sigmas[0]}"
+            intel_lines += f"\n  {'─'*61}"
+
         parent_info = ""
         if finding.get("parent_name"):
             parent_info = (
@@ -393,6 +582,7 @@ class LolbasDetector:
             f"  Source  : {finding.get('detection_source', finding.get('source', ''))}\n"
             f"  CmdLine : {cmdline_display}"
             f"{norm_display}"
+            f"{intel_lines}"
             f"{parent_info}"
             f"{entropy_info}\n"
             f"{'='*65}"

@@ -32,6 +32,7 @@ import os
 import sqlite3
 import datetime
 import threading
+import json
 
 # ── Redirect stdout/stderr when running under pythonw.exe ────────────────────
 # pythonw.exe (used by the desktop shortcut) sets sys.stdout and sys.stderr to
@@ -84,6 +85,7 @@ THEME = {
     "red":      "#f85149",
     "green":    "#3fb950",
     "yellow":   "#d29922",
+    "orange":   "#FFA500",
     "blue":     "#58a6ff",
     "purple":   "#bc8cff",
     "red_bg":   "rgba(248,81,73,0.12)",
@@ -464,6 +466,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.logic = logic
         self.setWindowTitle("Configure Cloud Integrations")
+        self.setWindowIcon(QIcon(os.path.join(BASE_DIR, "assets", "icon.ico")))
         self.setMinimumWidth(480)
         self.setStyleSheet(BASE_STYLE + f"QDialog {{ background: {THEME['surface']}; }}")
 
@@ -515,7 +518,13 @@ class SettingsDialog(QDialog):
             else:
                 self.logic.api_keys.pop(key, None)
         self.logic.webhook_url = self.webhook_field.text().strip()
-        utils.save_config(self.logic.api_keys, self.logic.webhook_url)
+        utils.save_config(
+            self.logic.api_keys,
+            self.logic.webhook_url,
+            webhook_critical=self.logic.webhook_critical,
+            webhook_high=self.logic.webhook_high,
+            webhook_chains=self.logic.webhook_chains,
+        )
         self.accept()
 
 
@@ -524,7 +533,11 @@ class SettingsDialog(QDialog):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _db_query(sql, params=()):
-    db = os.path.join(BASE_DIR, "threat_cache.db")
+    try:
+        from modules.utils import DB_FILE
+        db = DB_FILE
+    except Exception:
+        db = os.path.join(BASE_DIR, "threat_cache.db")
     if not os.path.isfile(db):
         return []
     try:
@@ -618,28 +631,42 @@ class CyberSentinelGUI(QMainWindow):
             from modules.amsi_monitor     import AmsiMonitor
             from modules.amsi_hook        import AmsiScanner, FilelessMonitor
             from modules.lolbin_detector  import LolbinDetector
-            from modules.driver_guard     import DriverGuard
             from modules.c2_fingerprint   import Ja3Monitor, FeodoMonitor, DgaMonitor
             from modules.intel_updater    import update_all, feed_status
             from modules.network_isolation import isolate_network, restore_network
 
+            _utils.init_db()
             self.logic        = ScannerLogic()
-            self.lolbas       = LolbasDetector()
-            self.byovd        = ByovdDetector()
-            self.correlator   = ChainCorrelator()
+            self.lolbas       = LolbasDetector(webhook_url=self.logic.webhook_url)
+            self.byovd        = ByovdDetector(webhook_url=self.logic.webhook_url)
+            self.correlator   = ChainCorrelator(
+                webhook_url=self.logic.webhook_url,
+                webhooks=self.logic._webhooks(),
+            )
             self.baseline     = BaselineEngine()
             self.amsi         = AmsiMonitor()
-            # ── Newly wired modules ────────────────────────────────────
-            self.lolbin       = LolbinDetector()
-            self.driver_guard = DriverGuard()
+            self.lolbin       = LolbinDetector(webhook_url=self.logic.webhook_url)
             self.fileless     = FilelessMonitor(correlator=self.correlator)
             self.amsi_scanner = AmsiScanner()
-            self.feodo        = FeodoMonitor()
-            self.dga          = DgaMonitor()
-            self.ja3          = Ja3Monitor()
+            _wh  = self.logic.webhook_url
+            _whs = self.logic._webhooks()
+            self.feodo        = FeodoMonitor(webhook_url=_wh, webhooks=_whs)
+            self.dga          = DgaMonitor(webhook_url=_wh,  webhooks=_whs)
+            self.ja3          = Ja3Monitor(webhook_url=_wh,  webhooks=_whs)
             # Start C2 background monitors
             self.feodo.start()
             self.ja3.start()
+            # Start WMI process monitor (LOLBin + BYOVD + Baseline)
+            self.amsi.start()
+            self.byovd.start_realtime_monitor()
+            import threading
+            from modules.daemon_monitor import _monitor_processes
+            threading.Thread(
+                target=_monitor_processes,
+                args=(self.logic, self.lolbas, self.byovd,
+                      self.baseline, self.dga, self.lolbin, self.fileless),
+                daemon=True
+            ).start()
             # ──────────────────────────────────────────────────────────
             self.update_all   = update_all
             self.feed_status  = feed_status
@@ -689,13 +716,13 @@ class CyberSentinelGUI(QMainWindow):
             ("lolbas",     self._build_lolbas_page),
             ("lolbin",     self._build_lolbin_page),
             ("byovd",      self._build_byovd_page),
-            ("driver_guard", self._build_driver_guard_page),
             ("chains",     self._build_chains_page),
             ("baseline",   self._build_baseline_page),
             ("fileless",   self._build_fileless_page),
             ("amsi_hook",  self._build_amsi_hook_page),
             ("network",    self._build_network_page),
-            ("intel",      self._build_intel_page),
+            ("intel",        self._build_intel_page),
+            ("intel_viewer", self._build_intel_viewer_page),
             ("settings",   self._build_settings_page),
             ("evaluation", self._build_evaluation_page),
             ("feedback",   self._build_feedback_page),
@@ -780,7 +807,6 @@ class CyberSentinelGUI(QMainWindow):
                 ("🪝  LoLBin Abuse",    "lolbas"),
                 ("🔍  LolbinDetector",  "lolbin"),
                 ("💀  BYOVD Drivers",   "byovd"),
-                ("🛡️  DriverGuard",     "driver_guard"),
                 ("🔗  Attack Chains",   "chains"),
                 ("📐  Baseline",        "baseline"),
                 ("👻  Fileless / AMSI", "fileless"),
@@ -789,6 +815,7 @@ class CyberSentinelGUI(QMainWindow):
             ("MANAGEMENT", [
                 ("🌐  Network",         "network"),
                 ("📡  Intel Feeds",     "intel"),
+                ("🗂️  Intel Viewer",    "intel_viewer"),
                 ("⚙️  Settings",          "settings"),
                 ("📈  Evaluation",        "evaluation"),
                 ("📝  Analyst Feedback",  "feedback"),
@@ -986,8 +1013,13 @@ class CyberSentinelGUI(QMainWindow):
     def _export_history(self, fmt: str):
         """Prompts for a save path then exports scan_cache to JSON or CSV."""
         from modules import utils as _u
+
+        # Build exports/json/ or exports/csv/ folder and create it if needed
+        export_dir = os.path.join(BASE_DIR, "exports", fmt)
+        os.makedirs(export_dir, exist_ok=True)
+
         ext  = "JSON Files (*.json)" if fmt == "json" else "CSV Files (*.csv)"
-        name = f"cybersentinel_export.{fmt}"
+        name = os.path.join(export_dir, f"cybersentinel_export.{fmt}")
         path, _ = QFileDialog.getSaveFileName(self, f"Export Scan History ({fmt.upper()})", name, ext)
         if not path:
             return
@@ -2113,7 +2145,7 @@ class CyberSentinelGUI(QMainWindow):
         if not name:
             self._lolbin_result.setPlainText("⚠  Enter a process name.")
             return
-        hit = self.lolbin.check_process(name, cmd)
+        hit = self.lolbin.check(name, cmd)
         if hit:
             self._lolbin_result.setPlainText(self.lolbin.format_alert(hit))
         else:
@@ -2146,8 +2178,28 @@ class CyberSentinelGUI(QMainWindow):
         scan_btn.setMinimumWidth(180)
         scan_btn.clicked.connect(self._run_byovd)
         btn_row.addWidget(scan_btn)
+
+        self._byovd_rt_btn = QPushButton("⏱  Start Real-Time Monitor")
+        self._byovd_rt_btn.setMinimumWidth(180)
+        self._byovd_rt_btn.clicked.connect(self._start_byovd_realtime)
+        btn_row.addWidget(self._byovd_rt_btn)
+
+        # ADD: stop button, hidden until monitor starts
+        self._byovd_stop_btn = QPushButton("⏹  Stop Monitor")
+        self._byovd_stop_btn.setMinimumWidth(150)
+        self._byovd_stop_btn.setVisible(False)
+        self._byovd_stop_btn.setStyleSheet(f"background-color: {THEME['red_bg']}; color: {THEME['red']};")
+        self._byovd_stop_btn.clicked.connect(self._stop_byovd_realtime)
+        btn_row.addWidget(self._byovd_stop_btn)
+
         btn_row.addStretch()
         inner_layout.addLayout(btn_row)
+
+        # Status label — hidden until monitor starts
+        self._byovd_rt_status = QLabel("🟢  Real-Time Monitor: Active")
+        self._byovd_rt_status.setStyleSheet(f"color: {THEME['green']}; font-size: 11px;")
+        self._byovd_rt_status.setVisible(False)
+        inner_layout.addWidget(self._byovd_rt_status)
 
         self._byovd_progress = QProgressBar()
         self._byovd_progress.setRange(0, 0)
@@ -2157,7 +2209,7 @@ class CyberSentinelGUI(QMainWindow):
 
         grp = QGroupBox("Driver Scan Results")
         grp_layout = QVBoxLayout(grp)
-        self._byovd_table = make_table(["Driver", "CVE", "SHA-256", "Risk Level", "Details"])
+        self._byovd_table = make_table(["Driver", "CVE", "SHA-256", "Vendor", "Used By", "Details"])
         grp_layout.addWidget(self._byovd_table)
         inner_layout.addWidget(grp, 1)
 
@@ -2184,103 +2236,36 @@ class CyberSentinelGUI(QMainWindow):
         if not findings:
             row = t.rowCount(); t.insertRow(row)
             t.setItem(row, 0, table_item("✅  No vulnerable drivers found", THEME["green"]))
-            for i in range(1, 5):
-                t.setItem(row, i, table_item(""))
+            for i in range(1, 6):
+                t.setItem(row, i, table_item("—"))
         else:
             for f in findings:
                 row = t.rowCount(); t.insertRow(row)
+                tools = ", ".join(f.get("known_tools", [])) or "N/A"
                 t.setItem(row, 0, table_item(f.get("driver_name", "—")))
-                t.setItem(row, 1, table_item(f.get("cve", "N/A"), THEME["red"]))
-                t.setItem(row, 2, table_item(f.get("sha256") or "", THEME["muted"]))
-                t.setItem(row, 3, table_item(f.get("risk_level", "HIGH"), THEME["red"]))
-                t.setItem(row, 4, table_item((f.get("description") or "")[:60], THEME["muted"]))
+                t.setItem(row, 1, table_item(f.get("cves", "N/A"), THEME["red"]))
+                t.setItem(row, 2, table_item((f.get("sha256") or "")[:20] + "…", THEME["muted"]))
+                t.setItem(row, 3, table_item(f.get("vendor", "Unknown"), THEME["muted"]))
+                t.setItem(row, 4, table_item(tools[:50], THEME["yellow"]))
+                t.setItem(row, 5, table_item((f.get("description") or "")[:60], THEME["muted"]))
 
-    # ── PAGE: DRIVER GUARD ────────────────────────────────────────────────────
-
-    def _build_driver_guard_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._page_header(
-            "🛡️", "DriverGuard",
-            "Kernel driver integrity monitor — checks loaded .sys files against threat signatures"
-        ))
-
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setContentsMargins(24, 20, 24, 20)
-        inner_layout.setSpacing(12)
-
-        btn_row = QHBoxLayout()
-        scan_btn = QPushButton("🛡️  Scan Drivers Now")
-        scan_btn.setObjectName("primary")
-        scan_btn.setMinimumWidth(180)
-        scan_btn.clicked.connect(self._run_driver_guard_scan)
-        btn_row.addWidget(scan_btn)
-        rt_btn = QPushButton("⏱  Start Real-Time Monitor")
-        rt_btn.clicked.connect(self._start_driver_guard_realtime)
-        btn_row.addWidget(rt_btn)
-        btn_row.addStretch()
-        inner_layout.addLayout(btn_row)
-
-        self._dg_progress = QProgressBar()
-        self._dg_progress.setRange(0, 0)
-        self._dg_progress.setVisible(False)
-        self._dg_progress.setFixedHeight(4)
-        inner_layout.addWidget(self._dg_progress)
-
-        grp = QGroupBox("Driver Guard Results")
-        grp_layout = QVBoxLayout(grp)
-        self._dg_table = make_table(["Driver", "SHA-256", "CVE / Threat", "Details"])
-        grp_layout.addWidget(self._dg_table)
-        inner_layout.addWidget(grp, 1)
-
-        layout.addWidget(inner, 1)
-        return page
-
-    def _run_driver_guard_scan(self):
-        self._dg_table.setRowCount(0)
-        self._dg_progress.setVisible(True)
-
-        def _do():
-            import os
-            findings = []
-            drv_dir = r"C:\Windows\System32\drivers"
-            if os.path.isdir(drv_dir):
-                for fname in os.listdir(drv_dir):
-                    if fname.lower().endswith(".sys"):
-                        hit = self.driver_guard.check_driver(os.path.join(drv_dir, fname))
-                        if hit:
-                            findings.append(hit)
-            return findings
-
-        worker = GenericWorker(_do)
-        worker.finished.connect(self._dg_scan_done)
-        self._workers.append(worker)
-        worker.start()
-
-    def _dg_scan_done(self, findings):
-        self._dg_progress.setVisible(False)
-        t = self._dg_table
-        t.setRowCount(0)
-        if not findings:
-            row = t.rowCount(); t.insertRow(row)
-            t.setItem(row, 0, table_item("✅  No suspicious kernel drivers detected", THEME["green"]))
-            for i in range(1, 4):
-                t.setItem(row, i, table_item(""))
-        else:
-            for f in findings:
-                row = t.rowCount(); t.insertRow(row)
-                t.setItem(row, 0, table_item(f.get("driver_name", "—")))
-                t.setItem(row, 1, table_item((f.get("sha256") or "")[:20] + "…", THEME["muted"]))
-                t.setItem(row, 2, table_item(f.get("cve", "N/A"), THEME["red"]))
-                t.setItem(row, 3, table_item((f.get("description") or "")[:80], THEME["muted"]))
-
-    def _start_driver_guard_realtime(self):
-        self.driver_guard.start_realtime_monitor()
-        from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.information(self, "DriverGuard", "Real-time kernel driver monitor started.")
+    # ADD: missing handler
+    def _start_byovd_realtime(self):
+        self.byovd.start_realtime_monitor()
+        self._byovd_rt_btn.setVisible(False)
+        self._byovd_stop_btn.setVisible(True)
+        self._byovd_rt_status.setVisible(True)
+        self._status_bar.setText("🟢  BYOVD real-time monitor active")
+        self._status_bar.setStyleSheet(f"color: {THEME['green']}; padding: 4px 12px; font-size: 11px;")
+    
+    def _stop_byovd_realtime(self):
+        self.byovd.stop_realtime_monitor()
+        self._byovd_stop_btn.setVisible(False)
+        self._byovd_rt_btn.setVisible(True)
+        self._byovd_rt_btn.setEnabled(True)
+        self._byovd_rt_status.setVisible(False)
+        self._status_bar.setText("● Ready")
+        self._status_bar.setStyleSheet(f"color: {THEME['muted']}; padding: 4px 12px; font-size: 11px;")
 
     # ── PAGE: ATTACK CHAINS ───────────────────────────────────────────────────
 
@@ -2291,7 +2276,7 @@ class CyberSentinelGUI(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self._page_header(
             "🔗", "Attack Chain Correlation",
-            "Multi-event attack sequence detection — reads from shared event timeline"
+            "Multi-event attack sequence detection — auto-refreshes every 5 s"
         ))
 
         inner = QWidget()
@@ -2308,6 +2293,7 @@ class CyberSentinelGUI(QMainWindow):
         btn_row.addStretch()
         inner_layout.addLayout(btn_row)
 
+        # ── Detected chains table ──────────────────────────────────────────
         grp = QGroupBox("Detected Attack Chains")
         grp_layout = QVBoxLayout(grp)
         self._chains_table = make_table(
@@ -2322,10 +2308,44 @@ class CyberSentinelGUI(QMainWindow):
         grp_layout.addWidget(self._chains_table)
         inner_layout.addWidget(grp, 1)
 
+        # ── Live Event Feed (event_timeline) ──────────────────────────────
+        feed_grp = QGroupBox("Live Event Feed  (raw event_timeline — last 30 events)")
+        feed_layout = QVBoxLayout(feed_grp)
+        self._event_feed_table = make_table(
+            ["Timestamp", "Event Type", "PID", "Detail"],
+            stretch_col=3,
+            wrap_last=True,
+        )
+        self._event_feed_table.setColumnWidth(0, 155)
+        self._event_feed_table.setColumnWidth(1, 160)
+        self._event_feed_table.setColumnWidth(2, 60)
+        self._event_feed_table.setFixedHeight(200)
+        feed_layout.addWidget(self._event_feed_table)
+        inner_layout.addWidget(feed_grp)
+
         layout.addWidget(inner, 1)
+
+        # Auto-refresh: poll every 5 s, only redraw when counts change
+        self._chains_last_count = -1
+        self._feed_last_count   = -1
+        self._chains_timer = QTimer(self)
+        self._chains_timer.timeout.connect(self._auto_refresh_chains)
+        self._chains_timer.start(5_000)
+
         return page
 
     def _refresh_chains(self):
+        # Always refresh the event feed first so triggering events are visible
+        # before and after correlation runs — fixes the race where clicking
+        # "Run Correlation Sweep" updated the chain table but left the Live
+        # Event Feed stale until the next 5-second auto-timer tick.
+        self._refresh_event_feed()
+        try:
+            feed_count = (_db_query("SELECT COUNT(*) as c FROM event_timeline") or [{"c": 0}])[0]["c"]
+            self._feed_last_count = feed_count  # keep timer in sync, prevent double-refresh
+        except Exception:
+            pass
+
         if hasattr(self, 'correlator'):
             try:
                 self.correlator.run_correlation()
@@ -2352,6 +2372,63 @@ class CyberSentinelGUI(QMainWindow):
                 t.setItem(row, 4, table_item(r.get("description") or "—", THEME["muted"]))
             # Resize rows so full description text is visible without truncation
             t.resizeRowsToContents()
+        # Sync chain count so timer skips re-running correlation unnecessarily
+        try:
+            chain_count = (_db_query("SELECT COUNT(*) as c FROM chain_alerts") or [{"c": 0}])[0]["c"]
+            self._chains_last_count = chain_count
+        except Exception:
+            pass
+    def _auto_refresh_chains(self):
+        """Polls both tables; redraws only when new rows arrive (zero flicker when idle)."""
+        try:
+            chain_count = (_db_query("SELECT COUNT(*) as c FROM chain_alerts") or [{"c": 0}])[0]["c"]
+            feed_count  = (_db_query("SELECT COUNT(*) as c FROM event_timeline") or [{"c": 0}])[0]["c"]
+        except Exception:
+            return
+
+        if feed_count != self._feed_last_count:
+            self._feed_last_count = feed_count
+            self._refresh_event_feed()
+            self._refresh_chains()   # run correlation whenever new events arrive
+            return
+
+        if chain_count != self._chains_last_count:
+            self._chains_last_count = chain_count
+            self._refresh_chains()
+
+    def _refresh_event_feed(self):
+        """Redraws the raw event_timeline feed panel."""
+        rows = _db_query(
+            "SELECT event_type, detail, pid, timestamp FROM event_timeline "
+            "ORDER BY timestamp DESC LIMIT 30"
+        )
+        t = self._event_feed_table
+        t.setRowCount(0)
+        if not rows:
+            r = t.rowCount(); t.insertRow(r)
+            t.setItem(r, 0, table_item("No events yet.", THEME["muted"]))
+            for i in range(1, 4):
+                t.setItem(r, i, table_item(""))
+            return
+
+        # Colour code by event type
+        _type_colors = {
+            "LOLBIN_ABUSE":   THEME["orange"],
+            "LOLBIN_DETECTOR": THEME["orange"],
+            "FILELESS_AMSI":  THEME["yellow"],
+            "C2_CONNECTION":  THEME["red"],
+            "BYOVD_LOAD":     THEME["red"],
+            "DGA_BEACON":     THEME.get("purple", THEME["blue"]),
+        }
+        for row_data in rows:
+            etype  = row_data.get("event_type", "—")
+            color  = _type_colors.get(etype, THEME["muted"])
+            r = t.rowCount(); t.insertRow(r)
+            t.setItem(r, 0, table_item(row_data.get("timestamp", ""), THEME["muted"]))
+            t.setItem(r, 1, table_item(etype, color))
+            t.setItem(r, 2, table_item(str(row_data.get("pid") or "—")))
+            t.setItem(r, 3, table_item(row_data.get("detail") or "—", THEME["muted"]))
+        t.resizeRowsToContents()
 
     # ── PAGE: BASELINE ────────────────────────────────────────────────────────
 
@@ -2450,7 +2527,7 @@ class CyberSentinelGUI(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self._page_header(
             "👻", "Fileless / AMSI Alerts",
-            "PowerShell ScriptBlock obfuscation detection via Windows Event Log 4104"
+            "PowerShell ScriptBlock obfuscation + LOLBin detection — auto-refreshes every 5 s"
         ))
 
         inner = QWidget()
@@ -2481,26 +2558,66 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.addWidget(grp, 1)
 
         layout.addWidget(inner, 1)
+
+        # Auto-refresh: poll DB every 5 s, only redraw when row count changes
+        self._fileless_last_count = -1
+        self._fileless_timer = QTimer(self)
+        self._fileless_timer.timeout.connect(self._auto_refresh_fileless)
+        self._fileless_timer.start(5_000)
+
         return page
+
+    def _auto_refresh_fileless(self):
+        """Polls fileless_alerts row count; redraws only when new rows arrive."""
+        try:
+            rows = _db_query("SELECT COUNT(*) as c FROM fileless_alerts")
+            count = rows[0]["c"] if rows else 0
+        except Exception:
+            count = 0
+        if count != self._fileless_last_count:
+            self._fileless_last_count = count
+            self._refresh_fileless()
 
     def _refresh_fileless(self):
         rows = _db_query(
-            "SELECT source, findings, pid, timestamp FROM fileless_alerts ORDER BY timestamp DESC LIMIT 50"
+            "SELECT source, findings, pid, timestamp FROM fileless_alerts ORDER BY timestamp DESC LIMIT 100"
         )
         t = self._fileless_table
         t.setRowCount(0)
         if not rows:
             row = t.rowCount(); t.insertRow(row)
-            t.setItem(row, 0, table_item("No fileless alerts detected yet.", THEME["muted"]))
+            t.setItem(row, 0, table_item("No fileless / LOLBin alerts detected yet.", THEME["muted"]))
             for i in range(1, 4):
                 t.setItem(row, i, table_item(""))
         else:
             for r in rows:
+                source   = r.get("source", "—")
+                findings = r.get("findings") or "—"
+                pid      = str(r.get("pid", "—"))
+                ts       = r.get("timestamp", "")
+
+                # Parse findings JSON into a readable one-liner
+                try:
+                    parsed = json.loads(findings)
+                    if isinstance(parsed, list):
+                        findings_text = " | ".join(
+                            f"{f.get('mitre','?')} — {f.get('indicator', f.get('desc','?'))}"
+                            for f in parsed
+                        )
+                    else:
+                        findings_text = findings
+                except Exception:
+                    findings_text = findings
+
+                # Colour: LOLBin rows in orange, AMSI rows in yellow
+                is_lolbin = "LOLBIN" in source.upper()
+                text_color = THEME["orange"] if is_lolbin else THEME["yellow"]
+
                 row = t.rowCount(); t.insertRow(row)
-                t.setItem(row, 0, table_item(r.get("timestamp", "")))
-                t.setItem(row, 1, table_item(r.get("source", "—")))
-                t.setItem(row, 2, table_item(r.get("pid", "—")))
-                t.setItem(row, 3, table_item(r.get("findings") or "—", THEME["yellow"]))
+                t.setItem(row, 0, table_item(ts))
+                t.setItem(row, 1, table_item(source, text_color))
+                t.setItem(row, 2, table_item(pid))
+                t.setItem(row, 3, table_item(findings_text, text_color))
             t.resizeRowsToContents()
 
     # ── PAGE: AMSI HOOK ───────────────────────────────────────────────────────
@@ -2584,6 +2701,10 @@ class CyberSentinelGUI(QMainWindow):
         self._amsi_pid = QLineEdit()
         self._amsi_pid.setPlaceholderText("Select row or type")
         self._amsi_pid.setMaximumWidth(90)
+        # Windows PIDs are 32-bit unsigned — cap at 7 digits (max real PID ~4194304)
+        from PyQt6.QtGui import QIntValidator
+        self._amsi_pid.setValidator(QIntValidator(1, 9999999, self._amsi_pid))
+        self._amsi_pid.setMaxLength(7)
         pid_row.addWidget(self._amsi_pid)
         pid_row.addStretch()
         ctrl_layout.addLayout(pid_row)
@@ -2593,9 +2714,17 @@ class CyberSentinelGUI(QMainWindow):
         scan_mem_btn.clicked.connect(self._amsi_scan_memory)
         ctrl_layout.addWidget(scan_mem_btn)
 
-        bg_mon_btn = QPushButton("⏱  Start Background Monitor\n(all processes, 60 s interval)")
-        bg_mon_btn.clicked.connect(self._amsi_start_memory_monitor)
-        ctrl_layout.addWidget(bg_mon_btn)
+        # Store as instance var so _amsi_start_memory_monitor can disable it
+        self._amsi_bg_mon_btn = QPushButton("⏱  Start Background Monitor\n(all processes, 60 s interval)")
+        self._amsi_bg_mon_btn.clicked.connect(self._amsi_start_memory_monitor)
+        ctrl_layout.addWidget(self._amsi_bg_mon_btn)
+
+        # Stop button — hidden until monitor is running
+        self._amsi_bg_stop_btn = QPushButton("⏹  Stop Background Monitor")
+        self._amsi_bg_stop_btn.setObjectName("danger")
+        self._amsi_bg_stop_btn.clicked.connect(self._amsi_stop_memory_monitor)
+        self._amsi_bg_stop_btn.setVisible(False)
+        ctrl_layout.addWidget(self._amsi_bg_stop_btn)
 
         ctrl_layout.addStretch()
         splitter.addWidget(ctrl_panel)
@@ -2688,27 +2817,120 @@ class CyberSentinelGUI(QMainWindow):
             self._amsi_hook_output.setPlainText("✅  No malicious indicators found in script buffer.")
 
     def _amsi_scan_memory(self):
+        import threading
+        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+        from modules.amsi_hook import _scan_process_memory
+
         pid_s = self._amsi_pid.text().strip()
         if not pid_s.isdigit():
             self._amsi_hook_output.setPlainText("⚠  Select a process from the table or enter a valid PID.")
             return
+
+        # Resolve process name from the table selection so the memory scanner
+        # can correctly apply the high-value / JIT heuristics and set confidence.
         name_item = self._amsi_proc_table.item(self._amsi_proc_table.currentRow(), 1)
-        name = name_item.text() if name_item else pid_s
+        name = (name_item.text() if name_item else "").strip() or pid_s
+
         self._amsi_hook_output.setPlainText(f"[*] Scanning PID {pid_s} ({name}) for memory injection…")
-        hit = self.fileless.scan_process_memory(int(pid_s))
-        if not hit:
-            self._amsi_hook_output.setPlainText(
-                f"✅  PID {pid_s} ({name}): no memory injection patterns detected.")
-        else:
-            self._amsi_hook_output.setPlainText(
-                f"🔴  INJECTION PATTERN DETECTED in PID {pid_s} ({name}):\n{hit}")
+
+        def _run():
+            pid = int(pid_s)
+            # Call the low-level scanner directly so we get the findings list
+            # (scan_process_memory only returns bool; findings detail is lost).
+            findings = _scan_process_memory(pid, name)
+
+            if findings:
+                # Persist + webhook via the FilelessMonitor pipeline
+                self.fileless._log_to_db(f"PID:{pid}:{name}", "\n".join(findings), pid)
+                if self.fileless.webhook_url:
+                    try:
+                        from modules import utils as _utils
+                        _utils.send_webhook_alert(
+                            self.fileless.webhook_url,
+                            "🔴 Memory Injection Detected (manual scan)",
+                            {"PID": pid, "Process": name,
+                             "Findings": findings[0], "Total regions": len(findings)},
+                        )
+                    except Exception:
+                        pass
+                lines = "\n".join(f"  ✗ {f}" for f in findings)
+                text = f"🔴  INJECTION PATTERN DETECTED in PID {pid_s} ({name}):\n{lines}"
+            else:
+                text = f"✅  PID {pid_s} ({name}): no anonymous RWX regions detected."
+
+            QMetaObject.invokeMethod(
+                self._amsi_hook_output, "setPlainText",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, text),
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _amsi_start_memory_monitor(self):
-        self.fileless.start_memory_monitor()
+        import threading
+        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+
+        # Guard: disable button immediately so multiple clicks can't spawn
+        # multiple FilelessMemMonitor threads running in parallel.
+        btn = self._amsi_bg_mon_btn
+        btn.setEnabled(False)
+        btn.setText("⏱  Monitor Running\n(all processes, 60 s interval)")
+        self._amsi_bg_stop_btn.setVisible(True)
+
+        def _update_output(text):
+            QMetaObject.invokeMethod(
+                self._amsi_hook_output,
+                "setPlainText",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, text)
+            )
+
+        _update_output(
+            "[*] Starting background memory monitor...\n"
+            "    Please wait."
+        )
+
+        def _start():
+            try:
+                self.fileless.start_memory_monitor()
+                _update_output(
+                    "[+] Background memory injection monitor started.\n"
+                    "    Scanning all processes every 60 seconds.\n"
+                    "    Alerts will appear in Fileless / AMSI Alerts page."
+                )
+            except Exception as e:
+                _update_output(f"[!] Failed to start monitor: {e}")
+                # Re-enable Start / hide Stop if startup failed
+                QMetaObject.invokeMethod(
+                    btn, "setEnabled",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(bool, True)
+                )
+                QMetaObject.invokeMethod(
+                    btn, "setText",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, "⏱  Start Background Monitor\n(all processes, 60 s interval)")
+                )
+                QMetaObject.invokeMethod(
+                    self._amsi_bg_stop_btn, "setVisible",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(bool, False)
+                )
+
+        threading.Thread(target=_start, daemon=True).start()
+
+    def _amsi_stop_memory_monitor(self):
+        """Stops the background memory monitor and resets the Start/Stop buttons."""
+        try:
+            self.fileless.stop()
+        except Exception:
+            pass
+        self._amsi_bg_mon_btn.setEnabled(True)
+        self._amsi_bg_mon_btn.setText("⏱  Start Background Monitor\n(all processes, 60 s interval)")
+        self._amsi_bg_stop_btn.setVisible(False)
         self._amsi_hook_output.setPlainText(
-            "[+] Background memory injection monitor started.\n"
-            "    Scanning all processes every 60 seconds.\n"
-            "    Alerts will appear in Fileless / AMSI Alerts page."
+            "[*] Background memory monitor stopped.\n"
+            "    Click Start to resume scanning."
         )
 
     # ── PAGE: NETWORK ─────────────────────────────────────────────────────────
@@ -2875,6 +3097,599 @@ class CyberSentinelGUI(QMainWindow):
         self._intel_console.append_line("[+] Intel update complete.", THEME["green"])
         self._check_intel_status()
 
+    # ── PAGE: INTEL VIEWER ────────────────────────────────────────────────────
+
+    def _build_intel_viewer_page(self):
+        """
+        Browseable, searchable viewer for all four cached threat intel feeds:
+          Tab 1 — LOLBAS        (intel/lolbas.json)       232 LOLBin entries
+          Tab 2 — Feodo C2 IPs  (intel/feodo_blocklist.json) botnet C2 IPs
+          Tab 3 — JA3 Hashes    (intel/ja3_blocklist.csv)  TLS fingerprints
+          Tab 4 — LOLDrivers    (intel/loldrivers.json)    vulnerable drivers
+        """
+        import os as _os
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._page_header(
+            "🗂️", "Threat Intel Viewer",
+            "Browse, search and inspect the cached LOLBAS · Feodo · JA3 · LOLDrivers feeds"
+        ))
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(24, 16, 24, 16)
+        inner_layout.setSpacing(8)
+
+        # ── summary stat bar ─────────────────────────────────────────────────
+        stat_row = QHBoxLayout()
+        stat_row.setSpacing(10)
+        self._iv_stats = {}
+        for key, label, color in [
+            ("lolbas",   "LOLBAS entries",  THEME["purple"]),
+            ("feodo",    "C2 IPs (Feodo)",  THEME["red"]),
+            ("ja3",      "JA3 hashes",      THEME["yellow"]),
+            ("drivers",  "LOLDrivers",      THEME["orange"]),
+        ]:
+            card = QFrame()
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background: {THEME['surface']};
+                    border: 1px solid {THEME['border']};
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                }}
+            """)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(2)
+            count_lbl = QLabel("—")
+            count_lbl.setStyleSheet(f"color: {color}; font-size: 18px; font-weight: bold; border: none;")
+            name_lbl  = QLabel(label)
+            name_lbl.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px; border: none;")
+            card_layout.addWidget(count_lbl)
+            card_layout.addWidget(name_lbl)
+            stat_row.addWidget(card)
+            self._iv_stats[key] = count_lbl
+
+        refresh_btn = QPushButton("↻  Reload Feeds")
+        refresh_btn.setMinimumWidth(130)
+        refresh_btn.setMinimumHeight(48)
+        refresh_btn.clicked.connect(self._iv_reload_all)
+        stat_row.addWidget(refresh_btn)
+        inner_layout.addLayout(stat_row)
+
+        # ── tab widget ───────────────────────────────────────────────────────
+        self._iv_tabs = QTabWidget()
+        self._iv_tabs.setStyleSheet(f"""
+            QTabBar::tab {{ padding: 6px 18px; font-size: 11px; }}
+            QTabBar::tab:selected {{ color: {THEME['blue']}; border-bottom: 2px solid {THEME['blue']}; }}
+        """)
+        inner_layout.addWidget(self._iv_tabs, 1)
+
+        # build each tab
+        self._iv_tabs.addTab(self._iv_build_lolbas_tab(),   "🪝  LOLBAS  (LOLBins)")
+        self._iv_tabs.addTab(self._iv_build_feodo_tab(),    "🌐  Feodo  (C2 IPs)")
+        self._iv_tabs.addTab(self._iv_build_ja3_tab(),      "🔒  JA3  (TLS Fingerprints)")
+        self._iv_tabs.addTab(self._iv_build_drivers_tab(),  "💀  LOLDrivers")
+
+        layout.addWidget(inner, 1)
+
+        # load data on first show
+        QTimer.singleShot(0, self._iv_reload_all)
+        return page
+
+    # ── LOLBAS tab ───────────────────────────────────────────────────────────
+
+    def _iv_build_lolbas_tab(self):
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 10, 0, 0)
+        vl.setSpacing(8)
+
+        # search + filter row
+        row = QHBoxLayout()
+        self._iv_lolbas_search = QLineEdit()
+        self._iv_lolbas_search.setPlaceholderText("Search name, MITRE ID, category, use-case…")
+        self._iv_lolbas_search.textChanged.connect(self._iv_filter_lolbas)
+        self._iv_lolbas_cat = QComboBox()
+        self._iv_lolbas_cat.setMinimumWidth(130)
+        self._iv_lolbas_cat.currentIndexChanged.connect(self._iv_filter_lolbas)
+        row.addWidget(QLabel("Filter:"))
+        row.addWidget(self._iv_lolbas_search, 1)
+        row.addWidget(QLabel("Category:"))
+        row.addWidget(self._iv_lolbas_cat)
+        vl.addLayout(row)
+
+        # splitter: table on top, detail panel on bottom
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        self._iv_lolbas_table = make_table(
+            ["Name", "Category", "MITRE", "Privileges", "Use-case"],
+            stretch_col=4,
+        )
+        self._iv_lolbas_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._iv_lolbas_table.itemSelectionChanged.connect(self._iv_lolbas_detail)
+        splitter.addWidget(self._iv_lolbas_table)
+
+        # detail panel
+        detail_frame = QFrame()
+        detail_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {THEME['surface']};
+                border: 1px solid {THEME['border']};
+                border-radius: 6px;
+            }}
+        """)
+        dl = QVBoxLayout(detail_frame)
+        dl.setContentsMargins(12, 8, 12, 8)
+        detail_hdr = QLabel("Select a row to see full entry details")
+        detail_hdr.setStyleSheet(f"color: {THEME['muted']}; font-size: 11px; border: none;")
+        self._iv_lolbas_detail_hdr = detail_hdr
+        self._iv_lolbas_detail_body = QTextEdit()
+        self._iv_lolbas_detail_body.setReadOnly(True)
+        self._iv_lolbas_detail_body.setMaximumHeight(180)
+        self._iv_lolbas_detail_body.setStyleSheet(f"""
+            QTextEdit {{
+                background: {THEME['bg']};
+                color: {THEME['text']};
+                border: none;
+                font-size: 11px;
+                font-family: Consolas, monospace;
+            }}
+        """)
+        dl.addWidget(detail_hdr)
+        dl.addWidget(self._iv_lolbas_detail_body)
+        splitter.addWidget(detail_frame)
+        splitter.setSizes([400, 180])
+
+        vl.addWidget(splitter, 1)
+
+        # raw data cache for filtering
+        self._iv_lolbas_rows: list[dict] = []
+        return w
+
+    # ── Feodo tab ────────────────────────────────────────────────────────────
+
+    def _iv_build_feodo_tab(self):
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 10, 0, 0)
+        vl.setSpacing(8)
+
+        row = QHBoxLayout()
+        self._iv_feodo_search = QLineEdit()
+        self._iv_feodo_search.setPlaceholderText("Search IP, malware family, country, ASN…")
+        self._iv_feodo_search.textChanged.connect(self._iv_filter_feodo)
+        self._iv_feodo_status = QComboBox()
+        self._iv_feodo_status.addItems(["All", "online", "offline"])
+        self._iv_feodo_status.setMinimumWidth(100)
+        self._iv_feodo_status.currentIndexChanged.connect(self._iv_filter_feodo)
+        row.addWidget(QLabel("Filter:"))
+        row.addWidget(self._iv_feodo_search, 1)
+        row.addWidget(QLabel("Status:"))
+        row.addWidget(self._iv_feodo_status)
+        vl.addLayout(row)
+
+        self._iv_feodo_table = make_table(
+            ["IP Address", "Port", "Malware", "Status", "Country", "AS Name", "Last Online"],
+            stretch_col=5,
+        )
+        self._iv_feodo_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        vl.addWidget(self._iv_feodo_table, 1)
+
+        self._iv_feodo_rows: list[dict] = []
+        return w
+
+    # ── JA3 tab ──────────────────────────────────────────────────────────────
+
+    def _iv_build_ja3_tab(self):
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 10, 0, 0)
+        vl.setSpacing(8)
+
+        row = QHBoxLayout()
+        self._iv_ja3_search = QLineEdit()
+        self._iv_ja3_search.setPlaceholderText("Search JA3 hash or malware family…")
+        self._iv_ja3_search.textChanged.connect(self._iv_filter_ja3)
+        row.addWidget(QLabel("Filter:"))
+        row.addWidget(self._iv_ja3_search, 1)
+
+        note = QLabel("Malware families from abuse.ch SSLBL")
+        note.setStyleSheet(f"color: {THEME['muted']}; font-size: 10px;")
+        row.addWidget(note)
+        vl.addLayout(row)
+
+        self._iv_ja3_table = make_table(
+            ["JA3 Fingerprint (MD5)", "Malware Family", "First Seen", "Last Seen"],
+            stretch_col=0,
+        )
+        self._iv_ja3_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        vl.addWidget(self._iv_ja3_table, 1)
+
+        self._iv_ja3_rows: list[tuple] = []
+        return w
+
+    # ── LOLDrivers tab ───────────────────────────────────────────────────────
+
+    def _iv_build_drivers_tab(self):
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(0, 10, 0, 0)
+        vl.setSpacing(8)
+
+        row = QHBoxLayout()
+        self._iv_drivers_search = QLineEdit()
+        self._iv_drivers_search.setPlaceholderText("Search driver name, SHA256, MITRE, category…")
+        self._iv_drivers_search.textChanged.connect(self._iv_filter_drivers)
+        self._iv_drivers_cat = QComboBox()
+        self._iv_drivers_cat.setMinimumWidth(160)
+        self._iv_drivers_cat.currentIndexChanged.connect(self._iv_filter_drivers)
+        row.addWidget(QLabel("Filter:"))
+        row.addWidget(self._iv_drivers_search, 1)
+        row.addWidget(QLabel("Category:"))
+        row.addWidget(self._iv_drivers_cat)
+        vl.addLayout(row)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        self._iv_drivers_table = make_table(
+            ["Filename", "Category", "MITRE", "Verified", "SHA256"],
+            stretch_col=4,
+        )
+        self._iv_drivers_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._iv_drivers_table.itemSelectionChanged.connect(self._iv_drivers_detail)
+        splitter.addWidget(self._iv_drivers_table)
+
+        detail_frame = QFrame()
+        detail_frame.setStyleSheet(f"""
+            QFrame {{
+                background: {THEME['surface']};
+                border: 1px solid {THEME['border']};
+                border-radius: 6px;
+            }}
+        """)
+        dl = QVBoxLayout(detail_frame)
+        dl.setContentsMargins(12, 8, 12, 8)
+        self._iv_drivers_detail_hdr = QLabel("Select a row to see driver details")
+        self._iv_drivers_detail_hdr.setStyleSheet(f"color: {THEME['muted']}; font-size: 11px; border: none;")
+        self._iv_drivers_detail_body = QTextEdit()
+        self._iv_drivers_detail_body.setReadOnly(True)
+        self._iv_drivers_detail_body.setMaximumHeight(180)
+        self._iv_drivers_detail_body.setStyleSheet(f"""
+            QTextEdit {{
+                background: {THEME['bg']};
+                color: {THEME['text']};
+                border: none;
+                font-size: 11px;
+                font-family: Consolas, monospace;
+            }}
+        """)
+        dl.addWidget(self._iv_drivers_detail_hdr)
+        dl.addWidget(self._iv_drivers_detail_body)
+        splitter.addWidget(detail_frame)
+        splitter.setSizes([400, 180])
+
+        vl.addWidget(splitter, 1)
+
+        self._iv_drivers_rows: list[dict] = []
+        return w
+
+    # ── data loading ─────────────────────────────────────────────────────────
+
+    def _iv_reload_all(self):
+        """Load / reload all four intel feeds into their respective tables."""
+        self._iv_load_lolbas()
+        self._iv_load_feodo()
+        self._iv_load_ja3()
+        self._iv_load_drivers()
+
+    def _iv_load_lolbas(self):
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "intel", "lolbas.json")
+        try:
+            data = _json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return
+
+        # Flatten: one row per Command entry so each use-case is visible
+        rows = []
+        categories = set()
+        for entry in data:
+            name = entry.get("Name", "")
+            for cmd in (entry.get("Commands") or []):
+                cat   = cmd.get("Category", "—")
+                mitre = cmd.get("MitreID", "—")
+                priv  = cmd.get("Privileges", "—")
+                use   = cmd.get("Usecase", "—")
+                os_   = cmd.get("OperatingSystem", "—")
+                command = cmd.get("Command", "—")
+                desc  = entry.get("Description", "—")
+                full_paths = ", ".join(
+                    p.get("Path", "") for p in (entry.get("Full_Path") or [])
+                )
+                categories.add(cat)
+                rows.append({
+                    "name": name, "category": cat, "mitre": mitre,
+                    "privileges": priv, "usecase": use, "os": os_,
+                    "command": command, "description": desc, "full_paths": full_paths,
+                })
+
+        self._iv_lolbas_rows = rows
+
+        # populate category combo
+        self._iv_lolbas_cat.blockSignals(True)
+        self._iv_lolbas_cat.clear()
+        self._iv_lolbas_cat.addItem("All categories")
+        for c in sorted(categories):
+            self._iv_lolbas_cat.addItem(c)
+        self._iv_lolbas_cat.blockSignals(False)
+
+        self._iv_stats["lolbas"].setText(str(len(data)))
+        self._iv_populate_lolbas(rows)
+
+    def _iv_populate_lolbas(self, rows):
+        t = self._iv_lolbas_table
+        t.setRowCount(0)
+        cat_colors = {
+            "Execute":     THEME["red"],
+            "Download":    THEME["yellow"],
+            "AWL Bypass":  THEME["orange"],
+            "Reconnaissance": THEME["blue"],
+            "UAC Bypass":  THEME["purple"] if "purple" in THEME else THEME["blue"],
+            "Credentials": THEME["orange"],
+            "Compile":     THEME["muted"],
+        }
+        for r in rows:
+            row = t.rowCount(); t.insertRow(row)
+            cat   = r["category"]
+            color = cat_colors.get(cat, THEME["text"])
+            t.setItem(row, 0, table_item(r["name"],      THEME["blue"]))
+            t.setItem(row, 1, table_item(cat,             color))
+            t.setItem(row, 2, table_item(r["mitre"]))
+            t.setItem(row, 3, table_item(r["privileges"]))
+            t.setItem(row, 4, table_item(r["usecase"]))
+        t.resizeRowsToContents()
+
+    def _iv_filter_lolbas(self):
+        q   = self._iv_lolbas_search.text().lower()
+        cat = self._iv_lolbas_cat.currentText()
+        rows = [
+            r for r in self._iv_lolbas_rows
+            if (cat == "All categories" or r["category"] == cat)
+            and (not q or any(q in str(v).lower() for v in r.values()))
+        ]
+        self._iv_populate_lolbas(rows)
+
+    def _iv_lolbas_detail(self):
+        sel = self._iv_lolbas_table.selectedItems()
+        if not sel:
+            return
+        row_idx = self._iv_lolbas_table.currentRow()
+        # find matching raw row by name + mitre
+        name  = (self._iv_lolbas_table.item(row_idx, 0) or table_item("")).text()
+        mitre = (self._iv_lolbas_table.item(row_idx, 2) or table_item("")).text()
+        match = next(
+            (r for r in self._iv_lolbas_rows if r["name"] == name and r["mitre"] == mitre),
+            None
+        )
+        if not match:
+            return
+        self._iv_lolbas_detail_hdr.setText(
+            f"  {match['name']}  ·  {match['category']}  ·  {match['mitre']}"
+        )
+        self._iv_lolbas_detail_hdr.setStyleSheet(
+            f"color: {THEME['blue']}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        lines = [
+            f"Description : {match['description']}",
+            f"Use-case    : {match['usecase']}",
+            f"OS          : {match['os']}",
+            f"Privileges  : {match['privileges']}",
+            f"",
+            f"Command     : {match['command']}",
+            f"",
+            f"Full paths  : {match['full_paths']}",
+        ]
+        self._iv_lolbas_detail_body.setPlainText("\n".join(lines))
+
+    # ── Feodo ─────────────────────────────────────────────────────────────────
+
+    def _iv_load_feodo(self):
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "intel", "feodo_blocklist.json")
+        try:
+            data = _json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return
+        self._iv_feodo_rows = data
+        self._iv_stats["feodo"].setText(str(len(data)))
+        self._iv_populate_feodo(data)
+
+    def _iv_populate_feodo(self, rows):
+        t = self._iv_feodo_table
+        t.setRowCount(0)
+        for r in rows:
+            status = r.get("status", "—")
+            color  = THEME["red"] if status == "online" else THEME["muted"]
+            row = t.rowCount(); t.insertRow(row)
+            t.setItem(row, 0, table_item(r.get("ip_address", "—"), THEME["yellow"]))
+            t.setItem(row, 1, table_item(str(r.get("port", "—"))))
+            t.setItem(row, 2, table_item(r.get("malware", "—"), THEME["orange"]))
+            t.setItem(row, 3, table_item(status, color))
+            t.setItem(row, 4, table_item(r.get("country", "—")))
+            t.setItem(row, 5, table_item(r.get("as_name", "—")))
+            t.setItem(row, 6, table_item(r.get("last_online", "—")))
+        t.resizeRowsToContents()
+
+    def _iv_filter_feodo(self):
+        q      = self._iv_feodo_search.text().lower()
+        status = self._iv_feodo_status.currentText()
+        rows = [
+            r for r in self._iv_feodo_rows
+            if (status == "All" or r.get("status", "") == status)
+            and (not q or any(q in str(v).lower() for v in r.values()))
+        ]
+        self._iv_populate_feodo(rows)
+
+    # ── JA3 ───────────────────────────────────────────────────────────────────
+
+    def _iv_load_ja3(self):
+        import os as _os
+        path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "intel", "ja3_blocklist.csv")
+        rows = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 4:
+                        rows.append((parts[0], parts[3], parts[1], parts[2]))
+                    elif len(parts) == 3:
+                        rows.append((parts[0], "—", parts[1], parts[2]))
+        except Exception:
+            return
+        self._iv_ja3_rows = rows
+        self._iv_stats["ja3"].setText(str(len(rows)))
+        self._iv_populate_ja3(rows)
+
+    def _iv_populate_ja3(self, rows):
+        t = self._iv_ja3_table
+        t.setRowCount(0)
+        family_colors = {
+            "Dridex":  THEME["red"],
+            "TrickBot": THEME["orange"],
+            "Emotet":  THEME["red"],
+            "QakBot":  THEME["orange"],
+            "Adware":  THEME["yellow"],
+            "Tofsee":  THEME["yellow"],
+        }
+        for ja3, family, first_seen, last_seen in rows:
+            color = family_colors.get(family, THEME["text"])
+            row = t.rowCount(); t.insertRow(row)
+            t.setItem(row, 0, table_item(ja3, THEME["blue"]))
+            t.setItem(row, 1, table_item(family, color))
+            t.setItem(row, 2, table_item(first_seen))
+            t.setItem(row, 3, table_item(last_seen))
+        t.resizeRowsToContents()
+
+    def _iv_filter_ja3(self):
+        q = self._iv_ja3_search.text().lower()
+        rows = [r for r in self._iv_ja3_rows if not q or any(q in v.lower() for v in r)]
+        self._iv_populate_ja3(rows)
+
+    # ── LOLDrivers ────────────────────────────────────────────────────────────
+
+    def _iv_load_drivers(self):
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "intel", "loldrivers.json")
+        try:
+            data = _json.load(open(path, encoding="utf-8"))
+        except Exception:
+            return
+
+        rows = []
+        categories = set()
+        for entry in data:
+            cat      = entry.get("Category", "—")
+            mitre    = entry.get("MitreID", "—")
+            verified = entry.get("Verified", "—")
+            tags     = entry.get("Tags", [])
+            # pull filename from Tags (usually "driver.sys" style)
+            filename = tags[0] if tags else "—"
+            # pull SHA256 from first KnownVulnerableSamples entry
+            sha256   = "—"
+            cmd_desc = "—"
+            kvs = entry.get("KnownVulnerableSamples", [])
+            if kvs and isinstance(kvs, list) and kvs:
+                sha256 = kvs[0].get("SHA256", "—")
+            cmds = entry.get("Commands", {})
+            if isinstance(cmds, dict):
+                cmd_desc = cmds.get("Usecase", cmds.get("Description", "—"))
+            elif isinstance(cmds, list) and cmds:
+                cmd_desc = cmds[0].get("Usecase", cmds[0].get("Description", "—"))
+
+            categories.add(cat)
+            rows.append({
+                "filename": filename,
+                "category": cat,
+                "mitre":    mitre,
+                "verified": verified,
+                "sha256":   sha256,
+                "cmd_desc": cmd_desc,
+                "tags":     ", ".join(tags),
+            })
+
+        self._iv_drivers_rows = rows
+
+        self._iv_drivers_cat.blockSignals(True)
+        self._iv_drivers_cat.clear()
+        self._iv_drivers_cat.addItem("All categories")
+        for c in sorted(categories):
+            self._iv_drivers_cat.addItem(c)
+        self._iv_drivers_cat.blockSignals(False)
+
+        self._iv_stats["drivers"].setText(str(len(rows)))
+        self._iv_populate_drivers(rows)
+
+    def _iv_populate_drivers(self, rows):
+        t = self._iv_drivers_table
+        t.setRowCount(0)
+        for r in rows:
+            verified = r["verified"]
+            v_color = THEME["green"] if verified == "TRUE" else THEME["red"]
+            row = t.rowCount(); t.insertRow(row)
+            t.setItem(row, 0, table_item(r["filename"],          THEME["orange"]))
+            t.setItem(row, 1, table_item(r["category"]))
+            t.setItem(row, 2, table_item(r["mitre"],             THEME["yellow"]))
+            t.setItem(row, 3, table_item(verified,               v_color))
+            t.setItem(row, 4, table_item(r["sha256"],            THEME["muted"]))
+        t.resizeRowsToContents()
+
+    def _iv_filter_drivers(self):
+        q   = self._iv_drivers_search.text().lower()
+        cat = self._iv_drivers_cat.currentText()
+        rows = [
+            r for r in self._iv_drivers_rows
+            if (cat == "All categories" or r["category"] == cat)
+            and (not q or any(q in str(v).lower() for v in r.values()))
+        ]
+        self._iv_populate_drivers(rows)
+
+    def _iv_drivers_detail(self):
+        row_idx = self._iv_drivers_table.currentRow()
+        if row_idx < 0:
+            return
+        fname = (self._iv_drivers_table.item(row_idx, 0) or table_item("")).text()
+        sha   = (self._iv_drivers_table.item(row_idx, 4) or table_item("")).text()
+        match = next(
+            (r for r in self._iv_drivers_rows if r["filename"] == fname and r["sha256"] == sha),
+            None
+        )
+        if not match:
+            return
+        self._iv_drivers_detail_hdr.setText(
+            f"  {match['filename']}  ·  {match['category']}  ·  {match['mitre']}"
+        )
+        self._iv_drivers_detail_hdr.setStyleSheet(
+            f"color: {THEME['orange']}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        lines = [
+            f"Category    : {match['category']}",
+            f"MITRE       : {match['mitre']}",
+            f"Verified    : {match['verified']}",
+            f"Use-case    : {match['cmd_desc']}",
+            f"",
+            f"SHA256      : {match['sha256']}",
+            f"All tags    : {match['tags']}",
+        ]
+        self._iv_drivers_detail_body.setPlainText("\n".join(lines))
+
    # ── PAGE: SETTINGS ────────────────────────────────────────────────────────
 
     def _build_settings_page(self):
@@ -2988,16 +3803,36 @@ class CyberSentinelGUI(QMainWindow):
         inner_layout.addWidget(llm_grp)
 
         # Webhook
-        wh_grp = QGroupBox("SOC Webhook")
-        wh_layout = QHBoxLayout(wh_grp)
+        wh_grp = QGroupBox("SOC Webhook Routing")
+        wh_form = QFormLayout(wh_grp)
+        wh_form.setSpacing(8)
+
         self._webhook_field = QLineEdit()
-        self._webhook_field.setPlaceholderText("https://discord.com/api/webhooks/… or Slack/Teams URL")
+        self._webhook_field.setPlaceholderText("Catch-all fallback — Discord/Slack/Teams URL")
         self._webhook_field.setText(self.logic.webhook_url or "")
         test_wh_btn = QPushButton("🔔  Test")
         test_wh_btn.setMinimumWidth(80)
         test_wh_btn.clicked.connect(self._test_webhook)
-        wh_layout.addWidget(self._webhook_field)
-        wh_layout.addWidget(test_wh_btn)
+        _wh_row = QHBoxLayout()
+        _wh_row.addWidget(self._webhook_field)
+        _wh_row.addWidget(test_wh_btn)
+        wh_form.addRow(QLabel("Fallback (all):"), _wh_row)
+
+        self._webhook_critical_field = QLineEdit()
+        self._webhook_critical_field.setPlaceholderText("CRITICAL alerts — on-call / paged 24/7")
+        self._webhook_critical_field.setText(self.logic.webhook_critical or "")
+        wh_form.addRow(QLabel("🔴 Critical:"), self._webhook_critical_field)
+
+        self._webhook_high_field = QLineEdit()
+        self._webhook_high_field.setPlaceholderText("HIGH alerts — L1 analyst queue")
+        self._webhook_high_field.setText(self.logic.webhook_high or "")
+        wh_form.addRow(QLabel("🟠 High:"), self._webhook_high_field)
+
+        self._webhook_chains_field = QLineEdit()
+        self._webhook_chains_field.setPlaceholderText("Attack chain alerts — L2 / IR team")
+        self._webhook_chains_field.setText(self.logic.webhook_chains or "")
+        wh_form.addRow(QLabel("⛓️  Chains:"), self._webhook_chains_field)
+
         inner_layout.addWidget(wh_grp)
 
         # ── Allowlist / Exclusion Manager ─────────────────────────────────────────
@@ -3157,9 +3992,10 @@ class CyberSentinelGUI(QMainWindow):
                 self.logic.api_keys[key] = val
             else:
                 self.logic.api_keys.pop(key, None)
-        self.logic.webhook_url = self._webhook_field.text().strip()
-        # llm_model is hardcoded to "cybersentinel" — not user-configurable.
-        # Persist high-priority paths (split on newlines, strip blanks)
+        self.logic.webhook_url      = self._webhook_field.text().strip()
+        self.logic.webhook_critical = self._webhook_critical_field.text().strip()
+        self.logic.webhook_high     = self._webhook_high_field.text().strip()
+        self.logic.webhook_chains   = self._webhook_chains_field.text().strip()
         hp_raw = self._hp_paths_edit.toPlainText()
         hp_paths = [p.strip() for p in hp_raw.splitlines() if p.strip()]
         _utils.save_config(
@@ -3167,7 +4003,33 @@ class CyberSentinelGUI(QMainWindow):
             self.logic.webhook_url,
             self.logic.llm_model,
             high_priority_paths=hp_paths,
-        )
+            webhook_critical=self.logic.webhook_critical,
+            webhook_high=self.logic.webhook_high,
+            webhook_chains=self.logic.webhook_chains,
+        )  
+        # Push the new webhook URL into the already-running detector instances
+        # so alerts fire immediately without needing a daemon restart.
+        url = self.logic.webhook_url
+        _whs = self.logic._webhooks()
+        if hasattr(self, "lolbas"):
+            self.lolbas._webhook_url      = url
+        if hasattr(self, "lolbin"):
+            self.lolbin._webhook_url      = url
+        if hasattr(self, "byovd"):
+            self.byovd.webhook_url        = url
+        if hasattr(self, "correlator"):
+            self.correlator._webhook_url  = url
+            self.correlator._webhooks     = _whs
+        if hasattr(self, "feodo"):
+            self.feodo._webhook_url       = url
+            self.feodo._webhooks          = _whs
+        if hasattr(self, "dga"):
+            self.dga._webhook_url         = url
+            self.dga._webhooks            = _whs
+        if hasattr(self, "ja3"):
+            self.ja3._webhook_url         = url
+            self.ja3._webhooks            = _whs
+
         self._settings_status.setText(
             f"[+] Configuration saved — LLM: {self.logic.llm_model}"
         )
@@ -4715,6 +5577,7 @@ class CyberSentinelGUI(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("CyberSentinel v1")
+    app.setWindowIcon(QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.ico")))
 
     # Dark palette
     palette = QPalette()

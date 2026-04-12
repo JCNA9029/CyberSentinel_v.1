@@ -1,0 +1,16 @@
+python -c "
+import sqlite3, datetime, sys
+sys.path.insert(0, '.')
+from modules.chain_correlator import ChainCorrelator
+
+# Check dedup key uses strftime not events[0]
+import inspect
+src = inspect.getsource(ChainCorrelator.run_correlation)
+print('dedup key OK:', 'strftime' in src)
+print('prune OK:', '_prune_old_events' in src)
+
+# Check test script has _clear_events
+with open('test_attack_chains.py') as f:
+    ts = f.read()
+print('_clear_events OK:', '_clear_events' in ts)
+"
