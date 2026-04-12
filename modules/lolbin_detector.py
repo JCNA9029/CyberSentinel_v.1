@@ -1,12 +1,4 @@
 # modules/lolbin_detector.py — Feature 1: Living-off-the-Land Binary Abuse Detection
-#
-# Closes the most critical blind spot in the WMI daemon: CyberSentinel previously
-# excluded ALL c:\windows binaries. Attackers leverage this exclusion intentionally —
-# 79% of targeted attacks in 2023 used LOLBins (Picus Blue Report 2025).
-#
-# This module loads the LOLBAS project pattern database (data/lolbas_patterns.json)
-# and checks every new process name + command line against known abuse argument patterns.
-# It is purely a static lookup — zero network calls, negligible CPU cost.
 
 import json
 import os
@@ -17,7 +9,7 @@ import sqlite3
 import datetime
 from . import utils
 
-_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "lolbas_patterns.json")
+from .intel_updater import load_lolbas
 
 @dataclass
 class LolbinAlert:
@@ -28,7 +20,6 @@ class LolbinAlert:
     description:  str
     command_line: str
     pid:          int = 0
-
 
 class LolbinDetector:
     """
@@ -42,24 +33,42 @@ class LolbinDetector:
         self._load()
 
     def _load(self):
-        if not os.path.exists(_DATA_PATH):
-            print(f"[!] LolbinDetector: pattern database not found at {_DATA_PATH}")
-            return
         try:
-            with open(_DATA_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for entry in data.get("binaries", []):
-                key = entry["name"].lower()
-                self._patterns[key] = entry
-            print(f"[+] LolbinDetector: {len(self._patterns)} LOLBAS patterns loaded.")
+            raw = load_lolbas()
+            for entry in raw:
+                name = (entry.get("Name") or "").lower().strip()
+                if not name:
+                    continue
+
+                commands = entry.get("Commands") or []
+
+                mitre  = next((c.get("MitreID",  "") for c in commands if c.get("MitreID")),  "")
+                tactic = next((c.get("Category", "") for c in commands if c.get("Category")), "")
+
+                patterns: list[str] = []
+                for cmd in commands:
+                    for token in (cmd.get("Command") or "").split():
+                        if token.startswith(("-", "/")) and len(token) > 1:
+                            flag = token.rstrip(".,;:").lower()
+                            if flag not in patterns:
+                                patterns.append(flag)
+
+                self._patterns[name] = {
+                    "name":        name,
+                    "mitre":       mitre,
+                    "tactic":      tactic,
+                    "description": entry.get("Description", ""),
+                    "patterns":    patterns,
+                }
+
+            print(f"[+] LolbinDetector: {len(self._patterns)} LOLBAS entries loaded from intel feed.")
         except Exception as e:
-            print(f"[!] LolbinDetector: failed to load patterns — {e}")
+            print(f"[!] LolbinDetector: failed to load intel feed — {e}")
 
     def check(self, process_name: str, command_line: str, pid: int = 0) -> LolbinAlert | None:
         if not process_name:
             return None
 
-        # Normalise: strip path prefix, ensure .exe suffix
         raw = os.path.basename(process_name).lower().strip()
         if not raw.endswith(".exe"):
             raw += ".exe"
@@ -68,7 +77,6 @@ class LolbinDetector:
         if not entry:
             return None
 
-        # ── WMI CommandLine fallback ──────────────────────────────────────────
         # WMI Win32_Process.CommandLine is often None for short-lived processes
         # because the OS recycles the PEB before WMI reads it.  When that happens
         # we still know the binary name is a known LOLBin, so we emit a
@@ -84,7 +92,6 @@ class LolbinDetector:
                 pid          = pid,
             )
 
-        # Case-insensitive pattern match on the command line
         cmd_lower = command_line.lower()
         matched = [p for p in entry.get("patterns", []) if p.lower() in cmd_lower]
 
@@ -111,7 +118,7 @@ class LolbinDetector:
         print(        f"  Command Line: {alert.command_line[:200]}")
         colors.critical(f"{'='*62}\n")
         self._save_to_db(alert)
-    
+
     def format_alert(self, alert: LolbinAlert) -> str:
         """Returns a plain-text formatted alert string for GUI display."""
         return (
